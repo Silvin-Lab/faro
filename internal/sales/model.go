@@ -21,7 +21,9 @@ type Sale struct {
 	TotalCents      int        `json:"totalCents"`
 	AmountPaidCents int        `json:"amountPaidCents"`
 	ChangeCents     int        `json:"changeCents"`
-	PaymentMethod   string     `json:"paymentMethod"` // cash | card
+	DiscountCents   int        `json:"discountCents"`  // descuento de lealtad calculado en servidor
+	PromotionName   *string    `json:"promotionName"`  // nombre de la promo aplicada (o null)
+	PaymentMethod   string     `json:"paymentMethod"`  // cash | card
 	CustomerID      *string    `json:"customerId"`
 	CustomerName    *string    `json:"customerName"`
 	CreatedAt       time.Time  `json:"createdAt"`

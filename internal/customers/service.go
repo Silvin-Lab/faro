@@ -35,3 +35,18 @@ func (svc *Service) FindByPhone(ctx context.Context, tenantID, phone string) (Cu
 	}
 	return svc.store.findByPhone(ctx, tenantID, phone)
 }
+
+// Search busca clientes por nombre o teléfono (ILIKE). limit se acota a [1, 50].
+func (svc *Service) Search(ctx context.Context, tenantID, q string, limit int) ([]Customer, error) {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return nil, ErrValidation
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	return svc.store.searchByQuery(ctx, tenantID, q, limit)
+}
