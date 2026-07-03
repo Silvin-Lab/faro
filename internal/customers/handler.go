@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 
@@ -15,7 +16,7 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	r := chi.NewRouter()
 	r.Use(requireSession)
 	r.Post("/", svc.handleCreate)
-	r.Get("/", svc.handleSearch) // ?phone=...
+	r.Get("/", svc.handleSearch) // ?phone=<exacto> | ?q=<texto>&limit=20
 	return r
 }
 
@@ -66,7 +67,25 @@ func (svc *Service) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	c, err := svc.FindByPhone(r.Context(), tenantID, r.URL.Query().Get("phone"))
+	q := r.URL.Query()
+
+	// Búsqueda por texto (nombre o teléfono): devuelve una lista.
+	if q.Has("q") {
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		items, err := svc.Search(r.Context(), tenantID, q.Get("q"), limit)
+		switch {
+		case errors.Is(err, ErrValidation):
+			writeError(w, http.StatusBadRequest, "validation_error", "Indica un texto de búsqueda")
+		case err != nil:
+			writeError(w, http.StatusInternalServerError, "internal", "No se pudo buscar clientes")
+		default:
+			writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		}
+		return
+	}
+
+	// Lookup exacto por teléfono: devuelve un único cliente (retrocompatibilidad).
+	c, err := svc.FindByPhone(r.Context(), tenantID, q.Get("phone"))
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Indica un teléfono")

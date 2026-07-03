@@ -23,7 +23,7 @@ services:
       PORT: "8080"
       DATABASE_URL: "postgres://faro:faro@db:5432/faro?sslmode=disable"
       JWT_SECRET: "dev-insecure-secret-change-me"
-      CORS_ORIGIN: "http://localhost:3000"
+      CORS_ORIGIN: "${CORS_ORIGIN:-http://localhost:3000}"
     ports:
       - "8080:8080"
     depends_on:

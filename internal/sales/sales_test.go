@@ -13,13 +13,13 @@ import (
 func TestCreateValidatesInput(t *testing.T) {
 	svc := NewService(nil)
 	ctx := context.Background()
-	if _, err := svc.Create(ctx, "t1", nil, "cash", 100, nil); err != ErrValidation {
+	if _, err := svc.Create(ctx, "t1", nil, "cash", 100, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("items vacíos: esperaba ErrValidation, obtuvo %v", err)
 	}
-	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 0}}, "cash", 100, nil); err != ErrValidation {
+	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 0}}, "cash", 100, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("cantidad 0: esperaba ErrValidation, obtuvo %v", err)
 	}
-	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "cheque", 100, nil); err != ErrValidation {
+	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "cheque", 100, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("forma de pago inválida: esperaba ErrValidation, obtuvo %v", err)
 	}
 }
@@ -41,7 +41,7 @@ func testSvc(t *testing.T) (svc *Service, pool *pgxpool.Pool, a, b, prodA, prodI
 		pool.Close()
 		t.Skipf("DB de test no disponible: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE sale_items, sales, products, categories, users, tenants RESTART IDENTITY CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE loyalty_redemptions, loyalty_promotion_products, loyalty_promotions, sale_items, sales, customers, products, categories, users, tenants RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	priceA = 4500
@@ -57,7 +57,7 @@ func TestCreateSaleComputesTotalAndChange(t *testing.T) {
 	svc, pool, a, _, prodA, _, _, price := testSvc(t)
 	defer pool.Close()
 
-	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 2}}, "cash", 10000, nil)
+	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 2}}, "cash", 10000, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("crear venta: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestInsufficientPayment(t *testing.T) {
 	svc, pool, a, _, prodA, _, _, price := testSvc(t)
 	defer pool.Close()
 	// paga menos que el total (price*1).
-	if _, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price-1, nil); err != ErrInsufficientPayment {
+	if _, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price-1, nil, nil, nil); err != ErrInsufficientPayment {
 		t.Fatalf("pago insuficiente: esperaba ErrInsufficientPayment, obtuvo %v", err)
 	}
 }
@@ -88,7 +88,7 @@ func TestCardPaymentSetsExactAmount(t *testing.T) {
 	svc, pool, a, _, prodA, _, _, price := testSvc(t)
 	defer pool.Close()
 	// Con tarjeta, el monto enviado se ignora: el pagado = total y cambio = 0.
-	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "card", 0, nil)
+	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "card", 0, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("venta con tarjeta: %v", err)
 	}
@@ -101,10 +101,10 @@ func TestInactiveOrForeignProductRejected(t *testing.T) {
 	svc, pool, a, _, _, prodInactive, prodB, _ := testSvc(t)
 	defer pool.Close()
 	ctx := context.Background()
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodInactive, Quantity: 1}}, "cash", 100000, nil); err != ErrInvalidProduct {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodInactive, Quantity: 1}}, "cash", 100000, nil, nil, nil); err != ErrInvalidProduct {
 		t.Fatalf("producto inactivo: esperaba ErrInvalidProduct, obtuvo %v", err)
 	}
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodB, Quantity: 1}}, "cash", 100000, nil); err != ErrInvalidProduct {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodB, Quantity: 1}}, "cash", 100000, nil, nil, nil); err != ErrInvalidProduct {
 		t.Fatalf("producto de otro negocio: esperaba ErrInvalidProduct, obtuvo %v", err)
 	}
 }
@@ -114,7 +114,7 @@ func TestGetAndIsolation(t *testing.T) {
 	defer pool.Close()
 	ctx := context.Background()
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", 5000, nil)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", 5000, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("crear: %v", err)
 	}
@@ -133,5 +133,258 @@ func TestGetAndIsolation(t *testing.T) {
 	listB, _ := svc.List(ctx, b, nil, nil)
 	if len(listA) != 1 || len(listB) != 0 {
 		t.Fatalf("aislamiento listado: A=%d B=%d", len(listA), len(listB))
+	}
+}
+
+// seedPromotion inserta una promoción activa con un producto y devuelve su id.
+func seedPromotion(t *testing.T, pool *pgxpool.Pool, tenantID, productID, name string, pct, threshold int, resets bool) string {
+	t.Helper()
+	ctx := context.Background()
+	var id string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO loyalty_promotions (tenant_id, name, discount_percent, visit_threshold, resets_counter)
+		 VALUES ($1,$2,$3,$4,$5) RETURNING id::text`,
+		tenantID, name, pct, threshold, resets).Scan(&id); err != nil {
+		t.Fatalf("seed promo: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO loyalty_promotion_products (promotion_id, product_id, tenant_id) VALUES ($1,$2,$3)`,
+		id, productID, tenantID); err != nil {
+		t.Fatalf("seed promo product: %v", err)
+	}
+	return id
+}
+
+func TestSaleAppliesPromotionDiscount(t *testing.T) {
+	svc, pool, a, _, prodA, _, _, price := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	// Cliente con visits=2; promoción 50% umbral 3 => aplicable (2+1 >= 3), sin reinicio.
+	var cust string
+	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
+	promoID := seedPromotion(t, pool, a, prodA, "50% Latte", 50, 3, false)
+
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil)
+	if err != nil {
+		t.Fatalf("venta con promo: %v", err)
+	}
+	wantDiscount := (price*50 + 50) / 100 // 2250
+	if sale.DiscountCents != wantDiscount || sale.TotalCents != price-wantDiscount {
+		t.Fatalf("descuento: total=%d discount=%d (esperaba %d/%d)", sale.TotalCents, sale.DiscountCents, price-wantDiscount, wantDiscount)
+	}
+	if sale.PromotionName == nil || *sale.PromotionName != "50% Latte" {
+		t.Fatalf("promotionName esperaba '50%% Latte', obtuvo %v", sale.PromotionName)
+	}
+
+	var visits, lifetime int
+	pool.QueryRow(ctx, "SELECT visits, visits_lifetime FROM customers WHERE id=$1", cust).Scan(&visits, &lifetime)
+	if visits != 3 || lifetime != 1 {
+		t.Fatalf("contadores: visits=%d lifetime=%d (esperaba 3/1)", visits, lifetime)
+	}
+
+	// Snapshot en el historial.
+	var n, redemDiscount, cycleAt int
+	var causedReset bool
+	pool.QueryRow(ctx,
+		`SELECT count(*), coalesce(max(discount_cents),0), coalesce(bool_or(caused_reset),false), coalesce(max(visits_cycle_at),0)
+		   FROM loyalty_redemptions WHERE sale_id=$1`, sale.ID).Scan(&n, &redemDiscount, &causedReset, &cycleAt)
+	if n != 1 || redemDiscount != wantDiscount || causedReset || cycleAt != 3 {
+		t.Fatalf("redemption: n=%d discount=%d reset=%v cycleAt=%d", n, redemDiscount, causedReset, cycleAt)
+	}
+}
+
+func TestSalePromotion100ResetsAndSnapshots(t *testing.T) {
+	svc, pool, a, _, prodA, _, _, price := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	// Cliente con visits=2; promoción 100% (gratis) umbral 3, con reinicio.
+	var cust string
+	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
+	promoID := seedPromotion(t, pool, a, prodA, "Latte gratis", 100, 3, true)
+
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil)
+	if err != nil {
+		t.Fatalf("venta gratis: %v", err)
+	}
+	if sale.DiscountCents != price || sale.TotalCents != 0 {
+		t.Fatalf("gratis: total=%d discount=%d (esperaba 0/%d)", sale.TotalCents, sale.DiscountCents, price)
+	}
+
+	// Reinicio: visits -> 0; visits_lifetime conserva el incremento.
+	var visits, lifetime int
+	pool.QueryRow(ctx, "SELECT visits, visits_lifetime FROM customers WHERE id=$1", cust).Scan(&visits, &lifetime)
+	if visits != 0 || lifetime != 1 {
+		t.Fatalf("tras reinicio: visits=%d lifetime=%d (esperaba 0/1)", visits, lifetime)
+	}
+
+	var n int
+	var causedReset bool
+	var cycleAt int
+	pool.QueryRow(ctx,
+		`SELECT count(*), coalesce(bool_or(caused_reset),false), coalesce(max(visits_cycle_at),0)
+		   FROM loyalty_redemptions WHERE sale_id=$1`, sale.ID).Scan(&n, &causedReset, &cycleAt)
+	if n != 1 || !causedReset || cycleAt != 3 {
+		t.Fatalf("redemption: n=%d reset=%v cycleAt=%d (esperaba 1/true/3)", n, causedReset, cycleAt)
+	}
+}
+
+// TestSaleDiscountRoundTrip cierra DEFECTO-001: tras una venta con promoción que
+// da descuento>0, Get() y List() deben rehidratar DiscountCents y PromotionName
+// (no basta con que createSale los devuelva en la respuesta inmediata).
+func TestSaleDiscountRoundTrip(t *testing.T) {
+	svc, pool, a, _, prodA, _, _, price := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	var cust string
+	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
+	promoID := seedPromotion(t, pool, a, prodA, "50% Latte", 50, 3, false)
+
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil)
+	if err != nil {
+		t.Fatalf("venta con promo: %v", err)
+	}
+	wantDiscount := (price*50 + 50) / 100 // 2250
+
+	// Get() rehidrata descuento y nombre de promo.
+	got, err := svc.Get(ctx, a, sale.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.DiscountCents != wantDiscount {
+		t.Fatalf("get discount: esperaba %d, obtuvo %d", wantDiscount, got.DiscountCents)
+	}
+	if got.PromotionName == nil || *got.PromotionName != "50% Latte" {
+		t.Fatalf("get promotionName: esperaba '50%% Latte', obtuvo %v", got.PromotionName)
+	}
+
+	// List() también.
+	list, err := svc.List(ctx, a, nil, nil)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: err=%v len=%d", err, len(list))
+	}
+	if list[0].DiscountCents != wantDiscount {
+		t.Fatalf("list discount: esperaba %d, obtuvo %d", wantDiscount, list[0].DiscountCents)
+	}
+	if list[0].PromotionName == nil || *list[0].PromotionName != "50% Latte" {
+		t.Fatalf("list promotionName: esperaba '50%% Latte', obtuvo %v", list[0].PromotionName)
+	}
+}
+
+// TestSalePromotionEligibleButProductNotInCart cubre la regla §3.2: si la promo
+// es elegible por umbral pero ninguno de sus productos está en el carrito, la
+// venta se cobra normal (discount=0, sin fila en loyalty_redemptions) y el
+// contador de visitas incrementa pero NO se reinicia, aunque resets_counter=true.
+func TestSalePromotionEligibleButProductNotInCart(t *testing.T) {
+	svc, pool, a, _, prodA, _, _, price := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	// Otro producto del mismo negocio que NO es parte de la promoción.
+	var prodOther string
+	priceOther := 3000
+	pool.QueryRow(ctx, "INSERT INTO products (tenant_id, name, price_cents) VALUES ($1,'Muffin',$2) RETURNING id::text", a, priceOther).Scan(&prodOther)
+
+	var cust string
+	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
+	// Promo sobre prodA, con reinicio; el carrito solo lleva prodOther.
+	promoID := seedPromotion(t, pool, a, prodA, "Latte gratis", 100, 3, true)
+
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodOther, Quantity: 1}}, "cash", priceOther, &cust, &promoID, nil)
+	if err != nil {
+		t.Fatalf("venta sin producto de promo: %v", err)
+	}
+	if sale.DiscountCents != 0 || sale.TotalCents != priceOther {
+		t.Fatalf("cobro normal: total=%d discount=%d (esperaba %d/0)", sale.TotalCents, sale.DiscountCents, priceOther)
+	}
+	if sale.PromotionName != nil {
+		t.Fatalf("promotionName debía ser nil, obtuvo %v", sale.PromotionName)
+	}
+	_ = price
+
+	// visits incrementa (2 -> 3) pero NO se reinicia pese a resets_counter=true.
+	var visits, lifetime int
+	pool.QueryRow(ctx, "SELECT visits, visits_lifetime FROM customers WHERE id=$1", cust).Scan(&visits, &lifetime)
+	if visits != 3 || lifetime != 1 {
+		t.Fatalf("contadores: visits=%d lifetime=%d (esperaba 3/1, sin reinicio)", visits, lifetime)
+	}
+
+	// No hay fila en el historial de redenciones.
+	var n int
+	pool.QueryRow(ctx, "SELECT count(*) FROM loyalty_redemptions WHERE sale_id=$1", sale.ID).Scan(&n)
+	if n != 0 {
+		t.Fatalf("loyalty_redemptions: esperaba 0 filas, obtuvo %d", n)
+	}
+}
+
+// TestSalePromotionChoosesHigherPricedEligibleUnit cubre chooseUnit: con varios
+// productos elegibles en el carrito y sin promotionProductId, se beneficia la
+// unidad elegible de mayor precio; y con promotionProductId explícito, esa.
+func TestSalePromotionChoosesHigherPricedEligibleUnit(t *testing.T) {
+	svc, pool, a, _, prodA, _, _, price := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	// Segundo producto elegible, más caro que prodA (price=4500).
+	var prodPremium string
+	pricePremium := 6000
+	pool.QueryRow(ctx, "INSERT INTO products (tenant_id, name, price_cents) VALUES ($1,'Latte XL',$2) RETURNING id::text", a, pricePremium).Scan(&prodPremium)
+
+	// Promo con dos productos elegibles (prodA y prodPremium).
+	promoID := seedPromotion(t, pool, a, prodA, "10% bebida", 10, 3, false)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO loyalty_promotion_products (promotion_id, product_id, tenant_id) VALUES ($1,$2,$3)`,
+		promoID, prodPremium, a); err != nil {
+		t.Fatalf("seed segundo producto de promo: %v", err)
+	}
+
+	var cust string
+	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
+
+	// Sin promotionProductId: elige el elegible de mayor precio (prodPremium).
+	saleAuto, err := svc.Create(ctx, a,
+		[]LineInput{{ProductID: prodA, Quantity: 1}, {ProductID: prodPremium, Quantity: 1}},
+		"cash", price+pricePremium, &cust, &promoID, nil)
+	if err != nil {
+		t.Fatalf("venta auto: %v", err)
+	}
+	wantAuto := (pricePremium*10 + 50) / 100 // 600
+	if saleAuto.DiscountCents != wantAuto {
+		t.Fatalf("auto elige mayor precio: discount=%d (esperaba %d)", saleAuto.DiscountCents, wantAuto)
+	}
+
+	// Con promotionProductId=prodA explícito: beneficia esa unidad aunque sea más barata.
+	saleExplicit, err := svc.Create(ctx, a,
+		[]LineInput{{ProductID: prodA, Quantity: 1}, {ProductID: prodPremium, Quantity: 1}},
+		"cash", price+pricePremium, &cust, &promoID, &prodA)
+	if err != nil {
+		t.Fatalf("venta explícita: %v", err)
+	}
+	wantExplicit := (price*10 + 50) / 100 // 450
+	if saleExplicit.DiscountCents != wantExplicit {
+		t.Fatalf("explícito elige prodA: discount=%d (esperaba %d)", saleExplicit.DiscountCents, wantExplicit)
+	}
+}
+
+func TestSalePromotionNotEligible(t *testing.T) {
+	svc, pool, a, _, prodA, _, _, price := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	// Cliente con visits=2; promoción umbral 5 => 2+1 < 5 => no elegible (422).
+	var cust string
+	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
+	promoID := seedPromotion(t, pool, a, prodA, "50% Latte", 50, 5, false)
+
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil); err != ErrPromotionNotEligible {
+		t.Fatalf("promo no elegible: esperaba ErrPromotionNotEligible, obtuvo %v", err)
+	}
+	// La venta no se registró (rollback).
+	var sales int
+	pool.QueryRow(ctx, "SELECT count(*) FROM sales WHERE tenant_id=$1", a).Scan(&sales)
+	if sales != 0 {
+		t.Fatalf("no debía registrarse venta, obtuvo %d", sales)
 	}
 }
