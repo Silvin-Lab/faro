@@ -13,6 +13,7 @@ Sistematizar los procesos clave de una cafetería (productos, ventas, reportes, 
 | M4 | pos                   | Comanda/venta, agregar productos, cobro con cálculo de cambio, ticket       | 👁 review ✅ (pre-deploy) | 4 | M3 |
 | M5 | sales-reports         | Reportes diarios y por periodo, agrupados por categoría y horario           | 👁 review ✅ (pre-deploy) | 5 | M4 |
 | M6 | loyalty               | Alta por teléfono, puntos, tarjeta QR wallet iOS/Android, WhatsApp, redención| 🔨 entrada iniciada (clientes ✅) | 6 | M3, M4 |
+| M7 | business-settings     | Negocio único: super admin administra sucursales (M:N), usuarios y favicon; sucursal activa de sesión etiqueta ventas | 🎨 diseño listo (docs; ADR-006/007) | 7 | M1, M4, M5 |
 
 _Estados: 💡 idea · 📋 backlog · 🔍 discovery · 🎨 design · 🟢 ready · 🔨 in-dev · 🧪 qa · 👁 review · 🚀 deployed · ✅ done_
 

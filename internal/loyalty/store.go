@@ -215,6 +215,16 @@ func (s *store) customerStatus(ctx context.Context, tenantID, customerID string)
 		return CustomerStatus{}, err
 	}
 
+	// Conjunto de promociones ya canjeadas por el cliente en el ciclo actual. El
+	// ciclo actual arranca en last_reset_at = MAX(created_at) de las redenciones
+	// que reiniciaron el contador (caused_reset = true); si no hubo ninguna, se usa
+	// 'epoch' como piso. La fila que causó el reinicio pertenece al ciclo cerrado
+	// (created_at = last_reset_at), por eso se excluye con estricta desigualdad.
+	redeemed, err := s.redeemedThisCycle(ctx, tenantID, customerID)
+	if err != nil {
+		return CustomerStatus{}, err
+	}
+
 	rows, err := s.pool.Query(ctx,
 		`SELECT id::text, name, discount_percent, visit_threshold, resets_counter
 		   FROM loyalty_promotions WHERE tenant_id = $1 AND status = 'active'`, tenantID)
@@ -233,7 +243,8 @@ func (s *store) customerStatus(ctx context.Context, tenantID, customerID string)
 		if ps.VisitsRemaining < 0 {
 			ps.VisitsRemaining = 0
 		}
-		ps.ApplicableNow = st.Visits+1 >= ps.VisitThreshold
+		ps.RedeemedThisCycle = redeemed[ps.PromotionID]
+		ps.ApplicableNow = st.Visits+1 >= ps.VisitThreshold && !ps.RedeemedThisCycle
 		ps.Products = []PromoProduct{}
 		byID[ps.PromotionID] = len(st.Promotions)
 		st.Promotions = append(st.Promotions, ps)
@@ -277,6 +288,37 @@ func (s *store) customerStatus(ctx context.Context, tenantID, customerID string)
 		return a.Name < b.Name
 	})
 	return st, nil
+}
+
+// redeemedThisCycle devuelve el conjunto de promotion_id que el cliente ya canjeó
+// en el ciclo actual. El ciclo actual arranca en last_reset_at = MAX(created_at)
+// de las redenciones con caused_reset = true (o 'epoch' si no hubo reinicios).
+// Una promoción cuenta como canjeada en el ciclo si tiene una redención con
+// created_at ESTRICTAMENTE mayor que last_reset_at (la fila del reinicio pertenece
+// al ciclo que cerró).
+func (s *store) redeemedThisCycle(ctx context.Context, tenantID, customerID string) (map[string]bool, error) {
+	out := map[string]bool{}
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT promotion_id::text
+		   FROM loyalty_redemptions
+		  WHERE tenant_id = $1 AND customer_id = $2 AND promotion_id IS NOT NULL
+		    AND created_at > COALESCE(
+		          (SELECT MAX(created_at) FROM loyalty_redemptions
+		            WHERE tenant_id = $1 AND customer_id = $2 AND caused_reset = true),
+		          'epoch'::timestamptz)`,
+		tenantID, customerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // verifyOwnedProducts falla con ErrValidation si algún id no es un producto del

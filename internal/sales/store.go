@@ -48,7 +48,7 @@ type promotion struct {
 // lealtad se calculan con los precios de los productos del negocio (no se confía
 // en el cliente). Si se aplica una promoción, escribe el snapshot en
 // loyalty_redemptions e incrementa/reinicia el contador de visitas.
-func (s *store) createSale(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID *string) (Sale, error) {
+func (s *store) createSale(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID, branchID *string) (Sale, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Sale{}, err
@@ -113,6 +113,25 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 		if customerVisits+1 < promo.visitThreshold {
 			return Sale{}, ErrPromotionNotEligible
 		}
+		// Una promoción es redimible UNA sola vez por ciclo: rechazar si ya se
+		// canjeó en el ciclo actual (created_at > last_reset_at, donde last_reset_at
+		// = MAX(created_at) de las redenciones que reiniciaron el contador). Esto
+		// evita la doble redención por API dentro del mismo ciclo.
+		var redeemedThisCycle bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (
+			   SELECT 1 FROM loyalty_redemptions
+			    WHERE tenant_id = $1 AND customer_id = $2 AND promotion_id = $3
+			      AND created_at > COALESCE(
+			            (SELECT MAX(created_at) FROM loyalty_redemptions
+			              WHERE tenant_id = $1 AND customer_id = $2 AND caused_reset = true),
+			            'epoch'::timestamptz))`,
+			tenantID, *customerID, *promotionID).Scan(&redeemedThisCycle); err != nil {
+			return Sale{}, err
+		}
+		if redeemedThisCycle {
+			return Sale{}, ErrPromotionNotEligible
+		}
 		// Elegir la unidad beneficiada: promotionProductId si es elegible y está en
 		// el carrito; si no, el producto elegible de mayor precio en el carrito.
 		chosen := chooseUnit(lines, promo, promotionProductID)
@@ -151,14 +170,24 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 
 	var sale Sale
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO sales (tenant_id, total_cents, amount_paid_cents, change_cents, payment_method, customer_id, discount_cents)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 RETURNING id::text, tenant_id::text, total_cents, amount_paid_cents, change_cents, payment_method, customer_id::text, discount_cents, created_at`,
-		tenantID, total, amountPaid, change, paymentMethod, customerID, discountCents).
-		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.DiscountCents, &sale.CreatedAt); err != nil {
+		`INSERT INTO sales (tenant_id, total_cents, amount_paid_cents, change_cents, payment_method, customer_id, discount_cents, branch_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 RETURNING id::text, tenant_id::text, total_cents, amount_paid_cents, change_cents, payment_method, customer_id::text, discount_cents, branch_id::text, created_at`,
+		tenantID, total, amountPaid, change, paymentMethod, customerID, discountCents, branchID).
+		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.DiscountCents, &sale.BranchID, &sale.CreatedAt); err != nil {
 		return Sale{}, err
 	}
 	sale.CustomerName = customerName
+
+	// Nombre de la sucursal (informativo) para la respuesta de la venta.
+	if sale.BranchID != nil {
+		var name string
+		if err := tx.QueryRow(ctx,
+			`SELECT name FROM branches WHERE id = $1 AND tenant_id = $2`, *sale.BranchID, tenantID).Scan(&name); err != nil {
+			return Sale{}, err
+		}
+		sale.BranchName = &name
+	}
 
 	for _, l := range lines {
 		var item SaleItem
@@ -265,22 +294,24 @@ func chooseUnit(lines []computedLine, p promotion, promotionProductID *string) *
 
 // listByTenant lista ventas del negocio. Si se da rango [from, to) filtra por
 // fecha (para "ventas del día"); si no, devuelve las últimas 50.
-func (s *store) listByTenant(ctx context.Context, tenantID string, from, to *time.Time) ([]Sale, error) {
+func (s *store) listByTenant(ctx context.Context, tenantID, branchID string, from, to *time.Time) ([]Sale, error) {
 	const base = `SELECT s.id::text, s.tenant_id::text, s.total_cents, s.amount_paid_cents, s.change_cents,
-		        s.payment_method, s.customer_id::text, (cu.first_name || ' ' || cu.last_name), s.discount_cents, lr.promotion_name, s.created_at
+		        s.payment_method, s.customer_id::text, (cu.first_name || ' ' || cu.last_name), s.discount_cents, lr.promotion_name,
+		        s.branch_id::text, b.name, s.created_at
 		   FROM sales s
 		   LEFT JOIN customers cu ON cu.id = s.customer_id
-		   LEFT JOIN loyalty_redemptions lr ON lr.sale_id = s.id `
+		   LEFT JOIN loyalty_redemptions lr ON lr.sale_id = s.id
+		   LEFT JOIN branches b ON b.id = s.branch_id `
 
 	var rows pgx.Rows
 	var err error
 	if from != nil && to != nil {
 		rows, err = s.pool.Query(ctx, base+
-			`WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $3
-			 ORDER BY s.created_at DESC LIMIT 500`, tenantID, *from, *to)
+			`WHERE s.tenant_id = $1 AND s.branch_id = $2 AND s.created_at >= $3 AND s.created_at < $4
+			 ORDER BY s.created_at DESC LIMIT 500`, tenantID, branchID, *from, *to)
 	} else {
 		rows, err = s.pool.Query(ctx, base+
-			`WHERE s.tenant_id = $1 ORDER BY s.created_at DESC LIMIT 50`, tenantID)
+			`WHERE s.tenant_id = $1 AND s.branch_id = $2 ORDER BY s.created_at DESC LIMIT 50`, tenantID, branchID)
 	}
 	if err != nil {
 		return nil, err
@@ -290,7 +321,7 @@ func (s *store) listByTenant(ctx context.Context, tenantID string, from, to *tim
 	var out []Sale
 	for rows.Next() {
 		var sale Sale
-		if err := rows.Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.CreatedAt); err != nil {
+		if err := rows.Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.BranchID, &sale.BranchName, &sale.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, sale)
@@ -302,12 +333,14 @@ func (s *store) get(ctx context.Context, tenantID, id string) (Sale, error) {
 	var sale Sale
 	err := s.pool.QueryRow(ctx,
 		`SELECT s.id::text, s.tenant_id::text, s.total_cents, s.amount_paid_cents, s.change_cents,
-		        s.payment_method, s.customer_id::text, (cu.first_name || ' ' || cu.last_name), s.discount_cents, lr.promotion_name, s.created_at
+		        s.payment_method, s.customer_id::text, (cu.first_name || ' ' || cu.last_name), s.discount_cents, lr.promotion_name,
+		        s.branch_id::text, b.name, s.created_at
 		   FROM sales s
 		   LEFT JOIN customers cu ON cu.id = s.customer_id
 		   LEFT JOIN loyalty_redemptions lr ON lr.sale_id = s.id
+		   LEFT JOIN branches b ON b.id = s.branch_id
 		  WHERE s.id = $1 AND s.tenant_id = $2`, id, tenantID).
-		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.CreatedAt)
+		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.BranchID, &sale.BranchName, &sale.CreatedAt)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows), dberr.IsInvalidText(err):
 		return Sale{}, ErrNotFound

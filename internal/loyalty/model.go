@@ -40,14 +40,15 @@ type CustomerStatus struct {
 
 // PromotionStatus es la elegibilidad de una promoción para un cliente concreto.
 type PromotionStatus struct {
-	PromotionID     string         `json:"promotionId"`
-	Name            string         `json:"name"`
-	DiscountPercent int            `json:"discountPercent"`
-	VisitThreshold  int            `json:"visitThreshold"`
-	ResetsCounter   bool           `json:"resetsCounter"`
-	VisitsRemaining int            `json:"visitsRemaining"` // max(0, threshold - visits)
-	ApplicableNow   bool           `json:"applicableNow"`   // (visits + 1) >= threshold
-	Products        []PromoProduct `json:"products"`
+	PromotionID       string         `json:"promotionId"`
+	Name              string         `json:"name"`
+	DiscountPercent   int            `json:"discountPercent"`
+	VisitThreshold    int            `json:"visitThreshold"`
+	ResetsCounter     bool           `json:"resetsCounter"`
+	VisitsRemaining   int            `json:"visitsRemaining"`   // max(0, threshold - visits)
+	RedeemedThisCycle bool           `json:"redeemedThisCycle"` // ya canjeada en el ciclo actual
+	ApplicableNow     bool           `json:"applicableNow"`     // (visits+1 >= threshold) AND NOT redeemedThisCycle
+	Products          []PromoProduct `json:"products"`
 }
 
 // PromoProduct es un producto elegible de una promoción (para mostrar y elegir la

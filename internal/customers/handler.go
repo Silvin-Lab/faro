@@ -20,19 +20,6 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	return r
 }
 
-func tenantOf(w http.ResponseWriter, r *http.Request) (string, bool) {
-	u, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "No autenticado")
-		return "", false
-	}
-	if u.TenantID == nil {
-		writeError(w, http.StatusBadRequest, "tenant_required", "Esta operación requiere un negocio")
-		return "", false
-	}
-	return *u.TenantID, true
-}
-
 type createRequest struct {
 	Phone     string `json:"phone"`
 	FirstName string `json:"firstName"`
@@ -40,7 +27,7 @@ type createRequest struct {
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.TenantOf(w, r)
 	if !ok {
 		return
 	}
@@ -63,7 +50,7 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleSearch(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.TenantOf(w, r)
 	if !ok {
 		return
 	}

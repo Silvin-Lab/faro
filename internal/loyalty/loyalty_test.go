@@ -176,3 +176,113 @@ func TestCustomerStatusEligibility(t *testing.T) {
 		t.Fatalf("status cliente inexistente: esperaba ErrNotFound, obtuvo %v", err)
 	}
 }
+
+// statusForPromo busca la elegibilidad de una promoción por id en el status.
+func statusForPromo(st CustomerStatus, promoID string) (PromotionStatus, bool) {
+	for _, ps := range st.Promotions {
+		if ps.PromotionID == promoID {
+			return ps, true
+		}
+	}
+	return PromotionStatus{}, false
+}
+
+// TestCustomerStatusRedeemedThisCycle: una promo con umbral alcanzado pero ya
+// canjeada en el ciclo actual reporta redeemedThisCycle=true y applicableNow=false;
+// una promo alcanzada pero NO canjeada (rollover) sigue applicableNow=true.
+func TestCustomerStatusRedeemedThisCycle(t *testing.T) {
+	svc, pool, a, _, p1, p2, _ := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	var cust string
+	pool.QueryRow(ctx,
+		"INSERT INTO customers (tenant_id, phone, first_name, last_name, visits, visits_lifetime) VALUES ($1,'555','Ana','Paz',3,10) RETURNING id::text", a).Scan(&cust)
+
+	// Dos promos activas, ambas con umbral alcanzado (visits=3 >= umbral).
+	pRedeemed, err := svc.Create(ctx, a, PromotionInput{Name: "Redimida", DiscountPercent: 50, VisitThreshold: 3, ProductIDs: []string{p1}})
+	if err != nil {
+		t.Fatalf("promo redimida: %v", err)
+	}
+	pRollover, err := svc.Create(ctx, a, PromotionInput{Name: "Rollover", DiscountPercent: 50, VisitThreshold: 3, ProductIDs: []string{p2}})
+	if err != nil {
+		t.Fatalf("promo rollover: %v", err)
+	}
+
+	// Simular una venta que ya canjeó pRedeemed en el ciclo actual (sin reinicio).
+	var saleID string
+	pool.QueryRow(ctx,
+		`INSERT INTO sales (tenant_id, total_cents, amount_paid_cents, change_cents, payment_method, customer_id, discount_cents)
+		 VALUES ($1,2500,2500,0,'cash',$2,2500) RETURNING id::text`, a, cust).Scan(&saleID)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO loyalty_redemptions
+		   (tenant_id, customer_id, sale_id, promotion_id, promotion_name, discount_percent,
+		    visit_threshold, caused_reset, visits_cycle_at, visits_lifetime_at, discount_cents)
+		 VALUES ($1,$2,$3,$4,'Redimida',50,3,false,3,10,2500)`,
+		a, cust, saleID, pRedeemed.ID); err != nil {
+		t.Fatalf("insert redemption: %v", err)
+	}
+
+	st, err := svc.CustomerStatus(ctx, a, cust)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if got, ok := statusForPromo(st, pRedeemed.ID); !ok || !got.RedeemedThisCycle || got.ApplicableNow {
+		t.Fatalf("promo redimida: esperaba redeemedThisCycle=true applicableNow=false, obtuvo %+v (ok=%v)", got, ok)
+	}
+	// Rollover: alcanzada pero no canjeada => sigue aplicable.
+	if got, ok := statusForPromo(st, pRollover.ID); !ok || got.RedeemedThisCycle || !got.ApplicableNow {
+		t.Fatalf("promo rollover: esperaba redeemedThisCycle=false applicableNow=true, obtuvo %+v (ok=%v)", got, ok)
+	}
+}
+
+// TestCustomerStatusRedeemedResetNewCycle: una promo canjeada en el ciclo anterior
+// vuelve a estar disponible tras un reinicio (la redención vieja pertenece al ciclo
+// cerrado, created_at <= last_reset_at).
+func TestCustomerStatusRedeemedResetNewCycle(t *testing.T) {
+	svc, pool, a, _, p1, p2, _ := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	var cust string
+	pool.QueryRow(ctx,
+		"INSERT INTO customers (tenant_id, phone, first_name, last_name, visits, visits_lifetime) VALUES ($1,'555','Ana','Paz',3,20) RETURNING id::text", a).Scan(&cust)
+
+	pReg, err := svc.Create(ctx, a, PromotionInput{Name: "Regular", DiscountPercent: 50, VisitThreshold: 3, ProductIDs: []string{p1}})
+	if err != nil {
+		t.Fatalf("promo regular: %v", err)
+	}
+	pReset, err := svc.Create(ctx, a, PromotionInput{Name: "Reinicio", DiscountPercent: 100, VisitThreshold: 3, ProductIDs: []string{p2}})
+	if err != nil {
+		t.Fatalf("promo reinicio: %v", err)
+	}
+
+	var s1, s2 string
+	pool.QueryRow(ctx, `INSERT INTO sales (tenant_id, total_cents, amount_paid_cents, change_cents, payment_method, customer_id, discount_cents) VALUES ($1,2500,2500,0,'cash',$2,2500) RETURNING id::text`, a, cust).Scan(&s1)
+	// Redención de pReg en el ciclo viejo (created_at anterior).
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO loyalty_redemptions
+		   (tenant_id, customer_id, sale_id, promotion_id, promotion_name, discount_percent, visit_threshold, caused_reset, visits_cycle_at, visits_lifetime_at, discount_cents, created_at)
+		 VALUES ($1,$2,$3,$4,'Regular',50,3,false,3,18,2500, now() - interval '10 minutes')`,
+		a, cust, s1, pReg.ID); err != nil {
+		t.Fatalf("insert redemption regular: %v", err)
+	}
+	// Redención de pReset que reinició el contador (created_at posterior => cierra el ciclo).
+	pool.QueryRow(ctx, `INSERT INTO sales (tenant_id, total_cents, amount_paid_cents, change_cents, payment_method, customer_id, discount_cents) VALUES ($1,0,0,0,'cash',$2,5000) RETURNING id::text`, a, cust).Scan(&s2)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO loyalty_redemptions
+		   (tenant_id, customer_id, sale_id, promotion_id, promotion_name, discount_percent, visit_threshold, caused_reset, visits_cycle_at, visits_lifetime_at, discount_cents, created_at)
+		 VALUES ($1,$2,$3,$4,'Reinicio',100,3,true,3,19,5000, now() - interval '5 minutes')`,
+		a, cust, s2, pReset.ID); err != nil {
+		t.Fatalf("insert redemption reinicio: %v", err)
+	}
+
+	st, err := svc.CustomerStatus(ctx, a, cust)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	// pReg fue canjeada en el ciclo cerrado => en el nuevo ciclo NO cuenta como canjeada.
+	if got, ok := statusForPromo(st, pReg.ID); !ok || got.RedeemedThisCycle || !got.ApplicableNow {
+		t.Fatalf("promo regular tras reinicio: esperaba redeemedThisCycle=false applicableNow=true, obtuvo %+v (ok=%v)", got, ok)
+	}
+}

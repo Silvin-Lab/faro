@@ -10,30 +10,28 @@ import (
 	"faro/internal/auth"
 )
 
-// Routes se monta en /loyalty. Requiere sesión.
-func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.Handler {
+// Routes se monta en /loyalty. Lectura (listar/ver promos y estado del cliente) =
+// cualquier usuario del negocio; CRUD de promociones = solo super admin (matriz §7).
+func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Use(requireSession)
-	r.Get("/promotions", svc.handleList)
-	r.Post("/promotions", svc.handleCreate)
-	r.Get("/promotions/{id}", svc.handleGet)
-	r.Put("/promotions/{id}", svc.handleUpdate)
-	r.Delete("/promotions/{id}", svc.handleArchive)
-	r.Get("/customers/{customerId}/status", svc.handleCustomerStatus)
+	r.Group(func(r chi.Router) {
+		r.Use(requireSession)
+		r.Get("/promotions", svc.handleList)
+		r.Get("/promotions/{id}", svc.handleGet)
+		r.Get("/customers/{customerId}/status", svc.handleCustomerStatus)
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(requireSuperAdmin)
+		r.Post("/promotions", svc.handleCreate)
+		r.Put("/promotions/{id}", svc.handleUpdate)
+		r.Delete("/promotions/{id}", svc.handleArchive)
+	})
 	return r
 }
 
+// tenantOf resuelve el negocio del caller (businessTenantID para el super admin).
 func tenantOf(w http.ResponseWriter, r *http.Request) (string, bool) {
-	u, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "No autenticado")
-		return "", false
-	}
-	if u.TenantID == nil {
-		writeError(w, http.StatusBadRequest, "tenant_required", "Esta operación requiere un negocio")
-		return "", false
-	}
-	return *u.TenantID, true
+	return auth.ResolveTenant(w, r)
 }
 
 type promotionRequest struct {

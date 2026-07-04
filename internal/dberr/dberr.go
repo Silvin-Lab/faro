@@ -17,3 +17,7 @@ func IsUniqueViolation(err error) bool { return code(err, "23505") }
 
 // IsInvalidText indica un valor con formato inválido, p. ej. uuid mal formado (22P02).
 func IsInvalidText(err error) bool { return code(err, "22P02") }
+
+// IsForeignKeyViolation indica una violación de clave foránea (23503), p. ej.
+// intentar borrar una fila referenciada por otra tabla.
+func IsForeignKeyViolation(err error) bool { return code(err, "23503") }

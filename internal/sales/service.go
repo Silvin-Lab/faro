@@ -27,7 +27,8 @@ func NewService(pool *pgxpool.Pool) *Service {
 
 // Create valida la solicitud y registra la venta. El servidor calcula el total y
 // el descuento de lealtad desde la promoción (no se confía en el cliente).
-func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID *string) (Sale, error) {
+// branchID se deriva del usuario autenticado (nunca del cliente); nil = sin sucursal.
+func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID, branchID *string) (Sale, error) {
 	if len(items) == 0 || amountPaidCents < 0 {
 		return Sale{}, ErrValidation
 	}
@@ -37,6 +38,7 @@ func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInp
 	customerID = nilIfBlank(customerID)
 	promotionID = nilIfBlank(promotionID)
 	promotionProductID = nilIfBlank(promotionProductID)
+	branchID = nilIfBlank(branchID)
 	// La promoción solo tiene sentido con cliente asociado.
 	if customerID == nil {
 		promotionID = nil
@@ -47,7 +49,7 @@ func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInp
 			return Sale{}, ErrValidation
 		}
 	}
-	return svc.store.createSale(ctx, tenantID, items, paymentMethod, amountPaidCents, customerID, promotionID, promotionProductID)
+	return svc.store.createSale(ctx, tenantID, items, paymentMethod, amountPaidCents, customerID, promotionID, promotionProductID, branchID)
 }
 
 // nilIfBlank normaliza un puntero de string vacío/espacios a nil.
@@ -62,8 +64,10 @@ func nilIfBlank(p *string) *string {
 	return &v
 }
 
-func (svc *Service) List(ctx context.Context, tenantID string, from, to *time.Time) ([]Sale, error) {
-	return svc.store.listByTenant(ctx, tenantID, from, to)
+// List devuelve las ventas del negocio acotadas a una sucursal (la activa de la
+// sesión). branchID es obligatorio: el POS solo ve su propia sucursal.
+func (svc *Service) List(ctx context.Context, tenantID, branchID string, from, to *time.Time) ([]Sale, error) {
+	return svc.store.listByTenant(ctx, tenantID, branchID, from, to)
 }
 
 func (svc *Service) Get(ctx context.Context, tenantID, id string) (Sale, error) {

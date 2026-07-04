@@ -1,8 +1,17 @@
-# Modelo ER — Faro (hasta migración 0010)
+# Modelo ER — Faro (hasta migración 0012)
 
-Multi-tenant: todo dato de negocio cuelga de `tenants`. El super admin global es un
-`users` con `tenant_id NULL`. Clientes y lealtad son a nivel negocio → se comparten
-entre sucursales automáticamente.
+**Negocio único (ADR-007):** el sistema opera **un solo `tenants`** = el negocio. El super
+admin (dueño global, `tenant_id NULL`, `is_super_admin`) lo administra vía
+`businessTenantID()`; no pertenece a ninguna sucursal. Se conserva el esquema multi-tenant
+(`tenant_id`) por mínimo cambio. Clientes y lealtad se comparten entre sucursales.
+
+> **Sucursales (migraciones 0011 + 0012, ver ADR-006/ADR-007):** entra `branches` (capa
+> organizativa) y `tenants` gana `favicon_url` (0011); `sales` gana `branch_id`. La sucursal
+> del usuario es **M:N** vía `user_branches` (0012, reemplaza el `users.branch_id` único).
+> El personal pertenece a 1+ sucursales; tras login elige su **sucursal activa** (claim en el
+> JWT, `POST /auth/select-branch`), que etiqueta `sales.branch_id` (derivado en servidor) y el
+> encabezado del POS (`Faro. {sucursal activa}`). Bucket "Sin sucursal" = `branch_id NULL`
+> → reportes por sucursal. Administración de branches/favicon/usuarios: **solo super admin**.
 
 > **v2 lealtad (migración 0010, ver ADR-005):** se pasa de config única a **promociones**.
 > Se eliminan `loyalty_configs`, `loyalty_discount_products`, `loyalty_free_products`;
@@ -12,6 +21,10 @@ entre sucursales automáticamente.
 ```mermaid
 erDiagram
     tenants ||--o{ users        : "emplea"
+    tenants ||--o{ branches     : "opera"
+    users    ||--o{ user_branches : "pertenece"
+    branches ||--o{ user_branches : "incluye"
+    branches ||--o{ sales       : "registra en"
     tenants ||--o{ categories   : "tiene"
     tenants ||--o{ products     : "tiene"
     tenants ||--o{ sales        : "registra"
@@ -34,7 +47,16 @@ erDiagram
         uuid id PK
         text name
         text status "active|suspended"
+        text favicon_url "URL de /files/* (nullable)"
         timestamptz created_at
+    }
+    branches {
+        uuid id PK
+        uuid tenant_id FK
+        text name "UNIQUE(tenant_id,name)"
+        text status "active|inactive"
+        timestamptz created_at
+        timestamptz updated_at
     }
     users {
         uuid id PK
@@ -44,6 +66,12 @@ erDiagram
         text name
         bool is_super_admin
         text status "active|disabled"
+        timestamptz created_at
+    }
+    user_branches {
+        uuid user_id PK,FK
+        uuid branch_id PK,FK
+        uuid tenant_id FK
         timestamptz created_at
     }
     categories {
@@ -78,6 +106,7 @@ erDiagram
     sales {
         uuid id PK
         uuid tenant_id FK
+        uuid branch_id FK "sucursal de la venta (nullable, derivada del usuario)"
         uuid customer_id FK "opcional"
         int total_cents "tras descuento"
         int discount_cents "descuento lealtad (servidor)"
@@ -129,6 +158,14 @@ erDiagram
 ```
 
 ## Reglas de negocio clave
+- **Sucursales (ADR-006/ADR-007):** `branches` es una capa organizativa bajo el `tenants`
+  único (`UNIQUE(tenant_id, name)`). El personal pertenece a **1+ sucursales** vía
+  `user_branches` (M:N); el super admin las administra (solo super admin). Tras login, el
+  usuario elige su **sucursal activa** (claim `activeBranchId` en el JWT, `POST
+  /auth/select-branch`; auto si tiene 1). Esa sucursal etiqueta `sales.branch_id` **derivado
+  en servidor** (NULL = "Sin sucursal") y el encabezado del POS (`Faro. {sucursal activa}`).
+  `tenants.favicon_url` es el favicon por negocio (nullable → default). Coherencia
+  branch↔tenant validada en servicio.
 - **Lealtad por promociones** (visitas compartidas entre sucursales, ver ADR-005):
   `customers.visits` es el **contador de ciclo** y `customers.visits_lifetime` el acumulado
   de por vida. Cada venta pagada con cliente hace `visits += 1` y `visits_lifetime += 1`.

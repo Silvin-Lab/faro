@@ -107,26 +107,68 @@ la compra que **completa** el umbral ya cobra la recompensa). Sobre el contador
 **almacenado** `visits` (antes de esta venta):
 
 ```
-visitsRemaining = visit_threshold - visits        // "faltan" (lo que muestra el modal); se muestra clamp a >= 0
-applicableNow   = (visits + 1) >= visit_threshold  // ⇔ visitsRemaining <= 1
+visitsRemaining   = visit_threshold - visits        // "faltan" (lo que muestra el modal); se muestra clamp a >= 0
+redeemedThisCycle = ∃ redención de esta promo en el ciclo actual (ver abajo)
+applicableNow     = (visits + 1) >= visit_threshold  AND NOT redeemedThisCycle
 ```
 
-Ejemplo (contador almacenado `visits = 2`), tres promos de umbral 3, 5 y 7:
+**Una promoción es redimible UNA sola vez por ciclo.** Alcanzar el umbral la vuelve
+aplicable, pero al **redimirla** se "consume" y deja de estar disponible hasta que empiece
+un nuevo ciclo. Si el cajero **no** la aplica en la visita del umbral, la promo **sigue
+disponible** en visitas posteriores hasta que se redima (rollover; no desaparece por no
+usarse). Esto corrige el defecto en el que una promo sin reinicio quedaba `applicableNow`
+para siempre tras superar el umbral.
 
-| Promo | umbral | visitsRemaining | applicableNow | Texto en el modal |
-|-------|--------|-----------------|---------------|-------------------|
-| A | 3 | **1** | **true** | "A: se desbloquea con esta compra" |
-| B | 5 | 3 | false | "Faltan 3 visitas para B" |
-| C | 7 | 5 | false | "Faltan 5 visitas para C" |
+**Definición de "ciclo actual" y "redimida en el ciclo":**
+- `last_reset_at` = `MAX(created_at)` de las filas de `loyalty_redemptions` del cliente con
+  `caused_reset = true`. Si no hay ninguna → el ciclo abarca desde el inicio (piso `'epoch'`).
+- Una promo **P** está **redimida en el ciclo actual** (`redeemedThisCycle = true`) si existe
+  una fila en `loyalty_redemptions` con `customer_id = ?`, `promotion_id = P` y
+  `created_at > last_reset_at`. La fila que **causó** el reinicio (`caused_reset = true`)
+  tiene `created_at = last_reset_at`, por lo que pertenece al ciclo que **cerró**, no al nuevo
+  (se excluye con desigualdad estricta).
+
+Consecuencias de la semántica de ciclo:
+- Una promo con `resets_counter = true` que se redime pone `visits = 0` → nuevo ciclo: todas
+  las promos vuelven a estar disponibles (sus redenciones previas quedan en el ciclo cerrado).
+- Para promos sin reinicio, el ciclo solo cambia cuando **otra** promo con `resets_counter`
+  se redime. Mientras tanto, una promo redimida no reaparece como aplicable.
+
+Consulta backend usada (elegibilidad de status y validación de venta):
+```sql
+-- conjunto de promociones redimidas en el ciclo actual del cliente
+SELECT DISTINCT promotion_id
+  FROM loyalty_redemptions
+ WHERE tenant_id = $1 AND customer_id = $2 AND promotion_id IS NOT NULL
+   AND created_at > COALESCE(
+         (SELECT MAX(created_at) FROM loyalty_redemptions
+           WHERE tenant_id = $1 AND customer_id = $2 AND caused_reset = true),
+         'epoch'::timestamptz);
+```
+
+Ejemplo (contador almacenado `visits = 2`), tres promos de umbral 3, 5 y 7, **ninguna
+redimida en el ciclo**:
+
+| Promo | umbral | visitsRemaining | redeemedThisCycle | applicableNow | Texto en el modal |
+|-------|--------|-----------------|-------------------|---------------|-------------------|
+| A | 3 | **1** | false | **true** | "A: se desbloquea con esta compra" |
+| B | 5 | 3 | false | false | "Faltan 3 visitas para B" |
+| C | 7 | 5 | false | false | "Faltan 5 visitas para C" |
+
+Si A ya se redimió en este ciclo: `redeemedThisCycle = true` y `applicableNow = false`
+(no reaparece hasta un nuevo ciclo), aunque `visitsRemaining` siga siendo `≤ 1`.
 
 Reconciliación del off-by-one: el modal muestra `faltan = umbral − visits` (por eso
 "faltan 1" para la promo de 3 con `visits=2`, cumpliendo el ejemplo del usuario al pie de
 la letra), y **esa misma compra** es la que completa el umbral, por lo que A es aplicable
-ahora. Presentación por tramo (orden ascendente por `visitsRemaining`):
+ahora (si no fue ya redimida en el ciclo). Presentación por tramo (orden ascendente por
+`visitsRemaining`):
 - `visitsRemaining ≥ 2` → "Faltan {r} visitas para {name}" (informativo, no seleccionable).
-- `visitsRemaining == 1` → "{name}: se desbloquea con esta compra" (seleccionable/aplicable).
-- `visitsRemaining ≤ 0` → "{name}: disponible" (seleccionable; ya desbloqueada en una compra
-  anterior; ocurre con promos **sin reinicio** cuyo `visits` superó el umbral).
+- `visitsRemaining == 1` → "{name}: se desbloquea con esta compra" (seleccionable/aplicable
+  si `!redeemedThisCycle`).
+- `visitsRemaining ≤ 0` → "{name}: disponible" (seleccionable si `!redeemedThisCycle`; ya
+  desbloqueada en una compra anterior; ocurre con promos **sin reinicio** cuyo `visits`
+  superó el umbral y que aún no se redimieron en el ciclo).
 
 ### 3.2 Aplicación, descuento y reinicio
 
@@ -202,7 +244,8 @@ Promociones ordenadas **ascendente por `visitsRemaining`** (las aplicables prime
       "visitThreshold": 3,
       "resetsCounter": false,
       "visitsRemaining": 1,          // max(0, visitThreshold - visits)
-      "applicableNow": true,         // (visits + 1) >= visitThreshold  ⇔ visitsRemaining <= 1
+      "redeemedThisCycle": false,    // ya canjeada en el ciclo actual (§3.1)
+      "applicableNow": true,         // (visits + 1) >= visitThreshold  AND NOT redeemedThisCycle
       "products": [ { "id": "uuid", "name": "Café", "priceCents": 4500 } ]
     }
   ]
@@ -250,8 +293,10 @@ Request:
 - Reglas de servidor (dentro de la transacción de venta, orden exacto):
   1. Validar cliente y productos; calcular subtotal con precios propios.
   2. Si `promotionId` ≠ null (requiere `customerId`):
-     - la promoción debe ser del negocio, `status='active'` y **aplicable**
-       (`customer.visits + 1 ≥ visit_threshold`, §3.1) → si no, `422 promotion_not_eligible`.
+     - la promoción debe ser del negocio, `status='active'` y **aplicable**:
+       `customer.visits + 1 ≥ visit_threshold` **Y** no redimida en el ciclo actual
+       (`redeemedThisCycle = false`, §3.1) → si no, `422 promotion_not_eligible`. El check
+       de ciclo evita la doble redención por API dentro del mismo ciclo.
      - `chosen` = `promotionProductId` si es elegible y está en el carrito; si no, el
        producto elegible de mayor precio en el carrito.
      - Si `chosen` existe: `discount_cents = round(chosen.unit_price_cents ×

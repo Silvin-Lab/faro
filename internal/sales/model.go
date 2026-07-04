@@ -21,11 +21,13 @@ type Sale struct {
 	TotalCents      int        `json:"totalCents"`
 	AmountPaidCents int        `json:"amountPaidCents"`
 	ChangeCents     int        `json:"changeCents"`
-	DiscountCents   int        `json:"discountCents"`  // descuento de lealtad calculado en servidor
-	PromotionName   *string    `json:"promotionName"`  // nombre de la promo aplicada (o null)
-	PaymentMethod   string     `json:"paymentMethod"`  // cash | card
+	DiscountCents   int        `json:"discountCents"` // descuento de lealtad calculado en servidor
+	PromotionName   *string    `json:"promotionName"` // nombre de la promo aplicada (o null)
+	PaymentMethod   string     `json:"paymentMethod"` // cash | card
 	CustomerID      *string    `json:"customerId"`
 	CustomerName    *string    `json:"customerName"`
+	BranchID        *string    `json:"branchId"`   // sucursal derivada del usuario (nullable)
+	BranchName      *string    `json:"branchName"` // nombre de la sucursal (o null)
 	CreatedAt       time.Time  `json:"createdAt"`
 	Items           []SaleItem `json:"items,omitempty"`
 }

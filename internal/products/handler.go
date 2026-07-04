@@ -10,29 +10,21 @@ import (
 	"faro/internal/auth"
 )
 
-// Routes devuelve el router de productos (se monta en /products). requireSession
-// es el middleware de sesión de auth (reutilizado).
-func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.Handler {
+// Routes devuelve el router de productos (se monta en /products). Lectura (GET) =
+// cualquier usuario del negocio; escritura = solo super admin (matriz §7).
+func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Use(requireSession)
-	r.Post("/", svc.handleCreate)
-	r.Get("/", svc.handleList)
-	r.Get("/{id}", svc.handleGet)
-	r.Patch("/{id}", svc.handleUpdate)
+	r.Group(func(r chi.Router) {
+		r.Use(requireSession)
+		r.Get("/", svc.handleList)
+		r.Get("/{id}", svc.handleGet)
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(requireSuperAdmin)
+		r.Post("/", svc.handleCreate)
+		r.Patch("/{id}", svc.handleUpdate)
+	})
 	return r
-}
-
-func tenantOf(w http.ResponseWriter, r *http.Request) (string, bool) {
-	u, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "No autenticado")
-		return "", false
-	}
-	if u.TenantID == nil {
-		writeError(w, http.StatusBadRequest, "tenant_required", "Esta operación requiere un negocio")
-		return "", false
-	}
-	return *u.TenantID, true
 }
 
 type createRequest struct {
@@ -43,7 +35,7 @@ type createRequest struct {
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}
@@ -57,7 +49,7 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleList(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}
@@ -73,7 +65,7 @@ func (svc *Service) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleGet(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}
@@ -97,7 +89,7 @@ type updateRequest struct {
 }
 
 func (svc *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}

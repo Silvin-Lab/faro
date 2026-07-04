@@ -14,11 +14,26 @@ type Tenant struct {
 
 // User representa a un usuario del sistema. password_hash nunca se expone.
 type User struct {
-	ID           string    `json:"id"`
-	TenantID     *string   `json:"tenantId"` // nil solo para el super admin global
-	Email        string    `json:"email"`
-	Name         string    `json:"name"`
-	IsSuperAdmin bool      `json:"isSuperAdmin"`
-	Status       string    `json:"status"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID           string      `json:"id"`
+	TenantID     *string     `json:"tenantId"` // nil solo para el super admin global
+	Email        string      `json:"email"`
+	Name         string      `json:"name"`
+	IsSuperAdmin bool        `json:"isSuperAdmin"`
+	Status       string      `json:"status"`
+	Branches     []BranchRef `json:"branches,omitempty"` // membresías M:N (endpoints de /users)
+	CreatedAt    time.Time   `json:"createdAt"`
+}
+
+// BranchRef es la referencia mínima de una sucursal expuesta al cliente.
+type BranchRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// MeTenant es el negocio expuesto en GET /auth/me (para favicon y marca). null
+// cuando el usuario no tiene tenant (super admin global).
+type MeTenant struct {
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	FaviconURL *string `json:"faviconUrl"`
 }

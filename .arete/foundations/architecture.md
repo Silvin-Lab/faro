@@ -49,6 +49,22 @@ faro/  (backend)                     faro-ui/  (frontend)
 - **Sesión:** **JWT (HS256)** firmado, guardado en cookie **httpOnly + Secure + SameSite=Lax**; expiración ~8 h (un turno), renovación deslizante.
 - **Middleware:** valida la sesión, carga el usuario y su `tenant_id`, y acota el scope. (PIN y cajas: fase posterior.)
 
+## Negocio único, sucursales y personalización (M7 — ver ADR-006 + ADR-007)
+- **Negocio único:** el sistema opera **un solo `tenants`**. El **super admin** (dueño
+  global, `tenant_id NULL`) lo administra vía `businessTenantID()`; se retira `POST /tenants`.
+  Se conserva el esquema multi-tenant por mínimo cambio.
+- **Sucursales (`branches`)** son una **capa organizativa** bajo `tenants`; **no** subdividen
+  el aislamiento (clientes, lealtad, productos siguen compartidos). Administración (branches,
+  favicon, usuarios) **solo super admin** (`RequireSuperAdmin`).
+- **Membresía M:N** (`user_branches`): el personal pertenece a 1+ sucursales. Tras login
+  elige su **sucursal activa**, que viaja como **claim en el JWT** (`POST /auth/select-branch`
+  la fija, re-emitiendo la cookie). `POST /sales` deriva `sales.branch_id` del claim
+  (server-trusted; no se confía en el cliente). POS: `Faro. {sucursal activa}`.
+- **Favicon por negocio:** columna `tenants.favicon_url` (reusa `uploads`/`/files/*`),
+  inyectado en runtime en el cliente (no `generateMetadata`, por ser app autenticada
+  cross-origin). Expuesto vía `GET /auth/me`/login extendidos (`tenant{}`, `branches`,
+  `activeBranchId`).
+
 ## Límites y contratos
 - **Web ↔ API:** REST/JSON. La cookie de sesión viaja en cada request (no hay tokens en localStorage).
 - **API ↔ DB:** acceso solo desde la API; el frontend nunca habla con la DB.

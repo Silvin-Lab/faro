@@ -10,22 +10,18 @@ import (
 	"faro/internal/auth"
 )
 
-// Routes se monta en /reports. Requiere sesión.
-func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.Handler {
+// Routes se monta en /reports. Solo super admin (matriz §7): se monta con
+// requireSuperAdmin. El tenant se resuelve con ResolveTenant (businessTenantID).
+func (svc *Service) Routes(requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Use(requireSession)
+	r.Use(requireSuperAdmin)
 	r.Get("/sales", svc.handleSalesReport)
 	return r
 }
 
 func (svc *Service) handleSalesReport(w http.ResponseWriter, r *http.Request) {
-	u, ok := auth.UserFromContext(r.Context())
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "No autenticado")
-		return
-	}
-	if u.TenantID == nil {
-		writeError(w, http.StatusBadRequest, "tenant_required", "Esta operación requiere un negocio")
 		return
 	}
 
@@ -41,7 +37,18 @@ func (svc *Service) handleSalesReport(w http.ResponseWriter, r *http.Request) {
 	}
 	tz, _ := strconv.Atoi(r.URL.Query().Get("tz"))
 
-	rep, err := svc.SalesReport(r.Context(), *u.TenantID, from, to, tz)
+	// Filtro por sucursal: ?branchId=<uuid> acota; ?branchId=none|null es el bucket
+	// "Sin sucursal" (branch_id IS NULL); sin el param => todas.
+	var branch BranchFilter
+	if b := r.URL.Query().Get("branchId"); b != "" {
+		if b == "none" || b == "null" {
+			branch.None = true
+		} else {
+			branch.ID = &b
+		}
+	}
+
+	rep, err := svc.SalesReport(r.Context(), tenantID, from, to, tz, branch)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo generar el reporte")
 		return

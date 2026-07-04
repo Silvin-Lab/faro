@@ -8,9 +8,10 @@ import (
 
 // Claims son los datos de sesión que viajan en el JWT.
 type Claims struct {
-	UserID       string
-	TenantID     *string
-	IsSuperAdmin bool
+	UserID         string
+	TenantID       *string
+	IsSuperAdmin   bool
+	ActiveBranchID *string // sucursal activa de la sesión (ADR-007 §D4); nil si no hay
 }
 
 type tokenManager struct {
@@ -23,8 +24,9 @@ func newTokenManager(secret string, ttl time.Duration) *tokenManager {
 }
 
 type jwtClaims struct {
-	TenantID     string `json:"tid"`
-	IsSuperAdmin bool   `json:"sa"`
+	TenantID       string `json:"tid"`
+	IsSuperAdmin   bool   `json:"sa"`
+	ActiveBranchID string `json:"abid,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -36,10 +38,15 @@ func (tm *tokenManager) issue(c Claims) (string, time.Time, error) {
 	if c.TenantID != nil {
 		tid = *c.TenantID
 	}
+	abid := ""
+	if c.ActiveBranchID != nil {
+		abid = *c.ActiveBranchID
+	}
 
 	claims := jwtClaims{
-		TenantID:     tid,
-		IsSuperAdmin: c.IsSuperAdmin,
+		TenantID:       tid,
+		IsSuperAdmin:   c.IsSuperAdmin,
+		ActiveBranchID: abid,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   c.UserID,
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -69,5 +76,10 @@ func (tm *tokenManager) parse(tokenStr string) (Claims, error) {
 		v := jc.TenantID
 		tid = &v
 	}
-	return Claims{UserID: jc.Subject, TenantID: tid, IsSuperAdmin: jc.IsSuperAdmin}, nil
+	var abid *string
+	if jc.ActiveBranchID != "" {
+		v := jc.ActiveBranchID
+		abid = &v
+	}
+	return Claims{UserID: jc.Subject, TenantID: tid, IsSuperAdmin: jc.IsSuperAdmin, ActiveBranchID: abid}, nil
 }

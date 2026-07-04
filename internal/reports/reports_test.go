@@ -54,7 +54,7 @@ func TestSalesReport(t *testing.T) {
 	from := time.Now().Add(-time.Hour)
 	to := time.Now().Add(time.Hour)
 
-	rep, err := svc.SalesReport(ctx, a, from, to, 0)
+	rep, err := svc.SalesReport(ctx, a, from, to, 0, BranchFilter{})
 	if err != nil {
 		t.Fatalf("reporte: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestSalesReport(t *testing.T) {
 	}
 
 	// Aislamiento: el negocio B solo ve su venta (9999, sin items).
-	repB, err := svc.SalesReport(ctx, b, from, to, 0)
+	repB, err := svc.SalesReport(ctx, b, from, to, 0, BranchFilter{})
 	if err != nil {
 		t.Fatalf("reporte B: %v", err)
 	}

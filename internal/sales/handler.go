@@ -21,17 +21,15 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	return r
 }
 
-func tenantOf(w http.ResponseWriter, r *http.Request) (string, bool) {
-	u, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "No autenticado")
+// activeBranch devuelve la sucursal activa de la sesión (claim del JWT). Escribe
+// 400 branch_required y devuelve false si el usuario no tiene sucursal activa.
+func activeBranch(w http.ResponseWriter, r *http.Request) (string, bool) {
+	ab, _ := auth.ActiveBranchFromContext(r.Context())
+	if ab == nil || *ab == "" {
+		writeError(w, http.StatusBadRequest, "branch_required", "Debes seleccionar una sucursal")
 		return "", false
 	}
-	if u.TenantID == nil {
-		writeError(w, http.StatusBadRequest, "tenant_required", "Esta operación requiere un negocio")
-		return "", false
-	}
-	return *u.TenantID, true
+	return *ab, true
 }
 
 type lineRequest struct {
@@ -49,7 +47,13 @@ type createRequest struct {
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.TenantOf(w, r)
+	if !ok {
+		return
+	}
+	// La sucursal se deriva de la sesión activa (claim del JWT, ya validado en
+	// servidor); se ignora cualquier branchId que envíe el cliente (ADR-007 §D5).
+	branchID, ok := activeBranch(w, r)
 	if !ok {
 		return
 	}
@@ -63,7 +67,7 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 		items = append(items, LineInput{ProductID: it.ProductID, Quantity: it.Quantity})
 	}
 
-	sale, err := svc.Create(r.Context(), tenantID, items, req.PaymentMethod, req.AmountPaidCents, req.CustomerID, req.PromotionID, req.PromotionProductID)
+	sale, err := svc.Create(r.Context(), tenantID, items, req.PaymentMethod, req.AmountPaidCents, req.CustomerID, req.PromotionID, req.PromotionProductID, &branchID)
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Venta inválida (items y cantidades > 0)")
@@ -83,13 +87,19 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleList(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.TenantOf(w, r)
+	if !ok {
+		return
+	}
+	// "Ventas del día" se fuerza a la sucursal activa de la sesión: el POS no ve
+	// otras sucursales y no acepta branchId del cliente (matriz §7).
+	branchID, ok := activeBranch(w, r)
 	if !ok {
 		return
 	}
 	from := parseTime(r.URL.Query().Get("from"))
 	to := parseTime(r.URL.Query().Get("to"))
-	items, err := svc.List(r.Context(), tenantID, from, to)
+	items, err := svc.List(r.Context(), tenantID, branchID, from, to)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar las ventas")
 		return
@@ -113,7 +123,7 @@ func parseTime(s string) *time.Time {
 }
 
 func (svc *Service) handleGet(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := tenantOf(w, r)
+	tenantID, ok := auth.TenantOf(w, r)
 	if !ok {
 		return
 	}

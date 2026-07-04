@@ -12,11 +12,10 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// fullRouter monta auth + provisión como en el servidor real.
+// fullRouter monta auth + provisión como en el servidor real (M7 v2: sin /tenants).
 func fullRouter(svc *Service) http.Handler {
 	r := chi.NewRouter()
 	r.Mount("/auth", svc.Routes())
-	r.Mount("/tenants", svc.TenantRoutes())
 	r.Mount("/users", svc.UserRoutes())
 	return r
 }
@@ -94,65 +93,80 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 	}
 }
 
-func TestProvisioningAndTenantIsolation(t *testing.T) {
+// TestUserProvisioningM7 cubre la gestión de usuarios v2: solo super admin, membresía
+// M:N (branchIds), validación de sucursales del negocio y aislamiento de rol.
+func TestUserProvisioningM7(t *testing.T) {
 	svc, pool := testService(t)
 	defer pool.Close()
-	if _, err := svc.SeedSuperAdmin(context.Background(), "root@faro.test", "secret123"); err != nil {
-		t.Fatalf("seed: %v", err)
+	ctx := context.Background()
+
+	if _, err := svc.SeedSuperAdmin(ctx, "root@faro.test", "secret123"); err != nil {
+		t.Fatalf("seed super admin: %v", err)
 	}
+	// Negocio único + una sucursal.
+	tenant, _, err := svc.CreateTenantWithOwner(ctx, CreateTenantInput{
+		Name: "Vanta", OwnerEmail: "owner@vanta.test", OwnerPassword: "secret123", OwnerName: "Owner",
+	})
+	if err != nil {
+		t.Fatalf("crear negocio: %v", err)
+	}
+	var branchID string
+	pool.QueryRow(ctx, "INSERT INTO branches (tenant_id, name) VALUES ($1,'Centro') RETURNING id::text", tenant.ID).Scan(&branchID)
 
 	srv := httptest.NewServer(fullRouter(svc))
 	defer srv.Close()
 
-	// Super admin crea dos negocios con sus dueños.
 	root := jarClient(t)
 	login(t, root, srv.URL, "root@faro.test", "secret123")
-	if resp := post(t, root, srv.URL+"/tenants", map[string]string{
-		"name": "Cafe Uno", "ownerEmail": "owner@uno.test", "ownerPassword": "secret123", "ownerName": "Dueño Uno",
-	}); resp.StatusCode != http.StatusCreated {
-		t.Fatalf("crear negocio 1: esperaba 201, obtuvo %d", resp.StatusCode)
+
+	// Alta de un cajero con sucursal (M:N).
+	resp := post(t, root, srv.URL+"/users", map[string]any{
+		"email": "cajero@vanta.test", "password": "secret123", "name": "Cajero", "branchIds": []string{branchID},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("crear cajero: esperaba 201, obtuvo %d", resp.StatusCode)
 	}
-	if resp := post(t, root, srv.URL+"/tenants", map[string]string{
-		"name": "Cafe Dos", "ownerEmail": "owner@dos.test", "ownerPassword": "secret123", "ownerName": "Dueño Dos",
-	}); resp.StatusCode != http.StatusCreated {
-		t.Fatalf("crear negocio 2: esperaba 201, obtuvo %d", resp.StatusCode)
+	var created struct {
+		User User `json:"user"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	if len(created.User.Branches) != 1 || created.User.Branches[0].ID != branchID {
+		t.Fatalf("cajero sin membresía esperada: %+v", created.User.Branches)
 	}
 
-	// Dueño 1 inicia sesión: solo ve su negocio (1 usuario).
-	owner1 := jarClient(t)
-	login(t, owner1, srv.URL, "owner@uno.test", "secret123")
-	if n := usersCount(t, owner1, srv.URL); n != 1 {
-		t.Fatalf("negocio 1 esperaba 1 usuario, obtuvo %d", n)
+	// branchIds vacío => 400 validation_error.
+	if resp := post(t, root, srv.URL+"/users", map[string]any{
+		"email": "x@vanta.test", "password": "secret123", "name": "X", "branchIds": []string{},
+	}); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("branchIds vacío: esperaba 400, obtuvo %d", resp.StatusCode)
 	}
 
-	// Crea un barista en su negocio.
-	if resp := post(t, owner1, srv.URL+"/users", map[string]string{
-		"email": "barista@uno.test", "password": "secret123", "name": "Barista Uno",
-	}); resp.StatusCode != http.StatusCreated {
-		t.Fatalf("crear usuario: esperaba 201, obtuvo %d", resp.StatusCode)
+	// Sucursal inexistente => 404 branch_not_found.
+	if resp := post(t, root, srv.URL+"/users", map[string]any{
+		"email": "y@vanta.test", "password": "secret123", "name": "Y",
+		"branchIds": []string{"00000000-0000-0000-0000-000000000000"},
+	}); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("sucursal inexistente: esperaba 404, obtuvo %d", resp.StatusCode)
 	}
 
-	// Aislamiento: el negocio 1 ahora tiene 2 usuarios; el negocio 2, solo su dueño.
-	if n := usersCount(t, owner1, srv.URL); n != 2 {
-		t.Fatalf("negocio 1 esperaba 2 usuarios, obtuvo %d", n)
-	}
-	owner2 := jarClient(t)
-	login(t, owner2, srv.URL, "owner@dos.test", "secret123")
-	if n := usersCount(t, owner2, srv.URL); n != 1 {
-		t.Fatalf("negocio 2 esperaba 1 usuario (aislado), obtuvo %d", n)
-	}
-
-	// Un dueño (no super admin) no puede crear negocios -> 403.
-	if resp := post(t, owner1, srv.URL+"/tenants", map[string]string{
-		"name": "X", "ownerEmail": "x@x.test", "ownerPassword": "secret123", "ownerName": "X",
-	}); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("dueño creando negocio: esperaba 403, obtuvo %d", resp.StatusCode)
-	}
-
-	// Email duplicado -> 409.
-	if resp := post(t, owner1, srv.URL+"/users", map[string]string{
-		"email": "barista@uno.test", "password": "secret123", "name": "Repetido",
+	// Email duplicado => 409.
+	if resp := post(t, root, srv.URL+"/users", map[string]any{
+		"email": "cajero@vanta.test", "password": "secret123", "name": "Dup", "branchIds": []string{branchID},
 	}); resp.StatusCode != http.StatusConflict {
 		t.Fatalf("email duplicado: esperaba 409, obtuvo %d", resp.StatusCode)
+	}
+
+	// GET /users lista al owner + cajero (2), cada uno con branches.
+	if n := usersCount(t, root, srv.URL); n != 2 {
+		t.Fatalf("GET /users esperaba 2 usuarios, obtuvo %d", n)
+	}
+
+	// Un usuario de sucursal NO administra usuarios => 403 forbidden.
+	staff := jarClient(t)
+	login(t, staff, srv.URL, "cajero@vanta.test", "secret123")
+	if resp := post(t, staff, srv.URL+"/users", map[string]any{
+		"email": "z@vanta.test", "password": "secret123", "name": "Z", "branchIds": []string{branchID},
+	}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cajero creando usuario: esperaba 403, obtuvo %d", resp.StatusCode)
 	}
 }
