@@ -1,0 +1,34 @@
+# Fly.io — backend de Faro (producción)
+app = "faro-prod-api"
+primary_region = "iad"  # cerca de Neon us-east-1
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  UPLOAD_DIR = "/data/uploads"   # volumen persistente
+  COOKIE_SECURE = "true"         # HTTPS en prod
+
+# Volumen persistente para imágenes subidas (favicon/productos).
+[[mounts]]
+  source = "faro_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"     # POS: siempre encendido (sin cold start)
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "20s"
+    method = "get"
+    path = "/ready"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
