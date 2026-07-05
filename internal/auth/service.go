@@ -12,6 +12,9 @@ import (
 // si el email no existe o la contraseña es incorrecta (no filtrar información).
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
+// ErrWeakPassword indica que la nueva contraseña no cumple el mínimo.
+var ErrWeakPassword = errors.New("weak password")
+
 // Service expone la lógica de autenticación del módulo.
 type Service struct {
 	store        *store
@@ -45,6 +48,26 @@ func (svc *Service) authenticate(ctx context.Context, email, password string) (U
 		return User{}, ErrInvalidCredentials
 	}
 	return u, nil
+}
+
+// ChangePassword verifica la contraseña actual del usuario y establece una nueva
+// (mínimo 8 caracteres). Disponible para cualquier usuario autenticado.
+func (svc *Service) ChangePassword(ctx context.Context, userID, current, next string) error {
+	hash, err := svc.store.passwordHashByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !checkPassword(hash, current) {
+		return ErrInvalidCredentials
+	}
+	if len(next) < 8 {
+		return ErrWeakPassword
+	}
+	newHash, err := hashPassword(next)
+	if err != nil {
+		return err
+	}
+	return svc.store.updatePassword(ctx, userID, newHash)
 }
 
 // SeedSuperAdmin crea el super admin global si no existe (idempotente). Devuelve

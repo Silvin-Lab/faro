@@ -61,6 +61,29 @@ func (s *store) userByID(ctx context.Context, id string) (User, error) {
 	return u, nil
 }
 
+// passwordHashByID devuelve el hash actual del usuario (para verificar la contraseña
+// actual antes de cambiarla).
+func (s *store) passwordHashByID(ctx context.Context, id string) (string, error) {
+	var hash string
+	err := s.pool.QueryRow(ctx, `SELECT password_hash FROM users WHERE id = $1`, id).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return hash, err
+}
+
+// updatePassword establece un nuevo hash de contraseña para el usuario.
+func (s *store) updatePassword(ctx context.Context, id, hash string) error {
+	ct, err := s.pool.Exec(ctx, `UPDATE users SET password_hash = $2 WHERE id = $1`, id, hash)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // superAdminExists indica si ya existe un super admin global con ese email (para el seed idempotente).
 func (s *store) superAdminExists(ctx context.Context, email string) (bool, error) {
 	var exists bool

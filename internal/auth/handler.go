@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -15,7 +16,38 @@ func (svc *Service) Routes() http.Handler {
 	r.Post("/logout", svc.handleLogout)
 	r.With(svc.RequireSession).Get("/me", svc.handleMe)
 	r.With(svc.RequireSession).Post("/select-branch", svc.handleSelectBranch)
+	r.With(svc.RequireSession).Post("/change-password", svc.handleChangePassword)
 	return r
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"currentPassword"`
+	NewPassword     string `json:"newPassword"`
+}
+
+// handleChangePassword permite a cualquier usuario autenticado (super admin o de
+// sucursal) cambiar su propia contraseña, verificando la actual.
+func (svc *Service) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	u, ok := UserFromContext(r.Context())
+	if !ok {
+		unauthorized(w)
+		return
+	}
+	var req changePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.CurrentPassword == "" || req.NewPassword == "" {
+		writeError(w, http.StatusBadRequest, "validation_error", "Contraseña actual y nueva son requeridas")
+		return
+	}
+	switch err := svc.ChangePassword(r.Context(), u.ID, req.CurrentPassword, req.NewPassword); {
+	case errors.Is(err, ErrInvalidCredentials):
+		writeError(w, http.StatusBadRequest, "invalid_current_password", "La contraseña actual es incorrecta")
+	case errors.Is(err, ErrWeakPassword):
+		writeError(w, http.StatusBadRequest, "weak_password", "La nueva contraseña debe tener al menos 8 caracteres")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo cambiar la contraseña")
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 type loginRequest struct {
