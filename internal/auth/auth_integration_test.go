@@ -100,6 +100,65 @@ func TestLoginFlow(t *testing.T) {
 	}
 }
 
+// sessionCookieFrom extrae la cookie de sesión de una respuesta.
+func sessionCookieFrom(resp *http.Response) *http.Cookie {
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionCookieName {
+			return c
+		}
+	}
+	return nil
+}
+
+// TestSessionTTLByRole verifica que la expiración de la cookie de sesión (y por ende
+// del JWT) depende del rol: 7 días para super_admin/branch_admin, 20h para cashier.
+func TestSessionTTLByRole(t *testing.T) {
+	svc, pool := testService(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	if _, err := svc.SeedSuperAdmin(ctx, "root@faro.test", "secret123"); err != nil {
+		t.Fatalf("seed super admin: %v", err)
+	}
+	tenant, _, err := svc.CreateTenantWithOwner(ctx, CreateTenantInput{
+		Name: "Vanta", OwnerEmail: "owner@vanta.test", OwnerPassword: "secret123", OwnerName: "Owner",
+	})
+	if err != nil {
+		t.Fatalf("crear negocio: %v", err)
+	}
+	var branchID string
+	if err := pool.QueryRow(ctx, "INSERT INTO branches (tenant_id, name) VALUES ($1,'Centro') RETURNING id::text", tenant.ID).Scan(&branchID); err != nil {
+		t.Fatalf("crear sucursal: %v", err)
+	}
+	if _, err := svc.CreateUser(ctx, tenant.ID, "cajero@vanta.test", "secret123", "Cajero", RoleCashier, []string{branchID}); err != nil {
+		t.Fatalf("crear cajero: %v", err)
+	}
+
+	srv := httptest.NewServer(svc.Routes())
+	defer srv.Close()
+	client := srv.Client()
+
+	assertTTL := func(email, pass string, want time.Duration) {
+		t.Helper()
+		before := time.Now()
+		resp := postJSON(t, client, srv.URL+"/login", map[string]string{"email": email, "password": pass})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("login %s: esperaba 200, obtuvo %d", email, resp.StatusCode)
+		}
+		c := sessionCookieFrom(resp)
+		if c == nil {
+			t.Fatalf("login %s: sin cookie de sesión", email)
+		}
+		got := c.Expires.Sub(before)
+		if d := got - want; d < -2*time.Minute || d > 2*time.Minute {
+			t.Fatalf("TTL de %s = %v, esperaba ≈ %v", email, got, want)
+		}
+	}
+
+	assertTTL("root@faro.test", "secret123", 7*24*time.Hour)  // super_admin
+	assertTTL("cajero@vanta.test", "secret123", 20*time.Hour) // cashier
+}
+
 func TestLoginInvalidCredentials(t *testing.T) {
 	svc, pool := testService(t)
 	defer pool.Close()

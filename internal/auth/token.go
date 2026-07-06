@@ -30,9 +30,17 @@ type jwtClaims struct {
 	jwt.RegisteredClaims
 }
 
+// issue emite un token con el TTL base del manager (default). Para un TTL por rol
+// usar issueFor.
 func (tm *tokenManager) issue(c Claims) (string, time.Time, error) {
+	return tm.issueFor(c, tm.ttl)
+}
+
+// issueFor emite un token cuya expiración es now+ttl, permitiendo una duración de
+// sesión por rol (ver sessionTTLFor). La cookie debe usar el mismo exp devuelto.
+func (tm *tokenManager) issueFor(c Claims, ttl time.Duration) (string, time.Time, error) {
 	now := time.Now()
-	exp := now.Add(tm.ttl)
+	exp := now.Add(ttl)
 
 	tid := ""
 	if c.TenantID != nil {

@@ -98,7 +98,7 @@ func (svc *Service) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	mustSelect := len(branches) > 1 && active == nil
 
-	token, exp, err := svc.tokens.issue(Claims{UserID: u.ID, TenantID: u.TenantID, IsSuperAdmin: u.IsSuperAdmin, ActiveBranchID: active})
+	token, exp, err := svc.tokens.issueFor(Claims{UserID: u.ID, TenantID: u.TenantID, IsSuperAdmin: u.IsSuperAdmin, ActiveBranchID: active}, sessionTTLFor(u.Role))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo iniciar sesión")
 		return
@@ -186,7 +186,7 @@ func (svc *Service) handleSelectBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, exp, err := svc.tokens.issue(Claims{UserID: u.ID, TenantID: u.TenantID, IsSuperAdmin: u.IsSuperAdmin, ActiveBranchID: &member.ID})
+	token, exp, err := svc.tokens.issueFor(Claims{UserID: u.ID, TenantID: u.TenantID, IsSuperAdmin: u.IsSuperAdmin, ActiveBranchID: &member.ID}, sessionTTLFor(u.Role))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo seleccionar la sucursal")
 		return
