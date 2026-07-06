@@ -49,6 +49,24 @@ func (s *store) findByPhone(ctx context.Context, tenantID, phone string) (Custom
 	return c, err
 }
 
+// setVisits fija visits al valor dado y sube visits_lifetime con GREATEST (nunca
+// baja). Acotado al negocio: si el cliente no existe o es de otro tenant -> ErrNotFound.
+func (s *store) setVisits(ctx context.Context, tenantID, id string, visits int) (Customer, error) {
+	var c Customer
+	err := s.pool.QueryRow(ctx,
+		`UPDATE customers
+		    SET visits = $3,
+		        visits_lifetime = GREATEST(visits_lifetime, $3)
+		  WHERE tenant_id = $1 AND id = $2
+		 RETURNING id::text, tenant_id::text, phone, first_name, last_name, visits, visits_lifetime, created_at`,
+		tenantID, id, visits).
+		Scan(&c.ID, &c.TenantID, &c.Phone, &c.FirstName, &c.LastName, &c.Visits, &c.VisitsLifetime, &c.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Customer{}, ErrNotFound
+	}
+	return c, err
+}
+
 // searchByQuery busca clientes por nombre (first/last) o teléfono con ILIKE
 // '%q%', acotado al negocio y ordenado por nombre.
 func (s *store) searchByQuery(ctx context.Context, tenantID, q string, limit int) ([]Customer, error) {

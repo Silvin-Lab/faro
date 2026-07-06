@@ -16,7 +16,8 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	r := chi.NewRouter()
 	r.Use(requireSession)
 	r.Post("/", svc.handleCreate)
-	r.Get("/", svc.handleSearch) // ?phone=<exacto> | ?q=<texto>&limit=20
+	r.Get("/", svc.handleSearch)               // ?phone=<exacto> | ?q=<texto>&limit=20
+	r.Patch("/{id}/visits", svc.handleSetVisits) // ajuste manual (migración de tarjetas): solo admin
 	return r
 }
 
@@ -27,7 +28,7 @@ type createRequest struct {
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := auth.TenantOf(w, r)
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}
@@ -50,7 +51,7 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleSearch(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := auth.TenantOf(w, r)
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}
@@ -80,6 +81,45 @@ func (svc *Service) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "Cliente no encontrado")
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo buscar el cliente")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"customer": c})
+	}
+}
+
+// setVisitsRequest usa puntero para distinguir "visits" ausente de 0.
+type setVisitsRequest struct {
+	Visits *int `json:"visits"`
+}
+
+// handleSetVisits fija manualmente las visitas del ciclo (migración de tarjetas
+// físicas). Solo super_admin o branch_admin; el lifetime nunca decrece (GREATEST).
+func (svc *Service) handleSetVisits(w http.ResponseWriter, r *http.Request) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
+	if u.Role != auth.RoleSuperAdmin && u.Role != auth.RoleBranchAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ajustar visitas")
+		return
+	}
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	var req setVisitsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Visits == nil || *req.Visits < 0 {
+		writeError(w, http.StatusBadRequest, "validation_error", "visits debe ser un entero ≥ 0")
+		return
+	}
+	c, err := svc.SetVisits(r.Context(), tenantID, chi.URLParam(r, "id"), *req.Visits)
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "visits debe ser un entero ≥ 0")
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Cliente no encontrado")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo actualizar el cliente")
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"customer": c})
 	}

@@ -36,6 +36,15 @@ func (svc *Service) FindByPhone(ctx context.Context, tenantID, phone string) (Cu
 	return svc.store.findByPhone(ctx, tenantID, phone)
 }
 
+// SetVisits fija las visitas del ciclo del cliente (ajuste manual: migración de
+// tarjetas físicas). El acumulado de por vida nunca decrece (GREATEST en el store).
+func (svc *Service) SetVisits(ctx context.Context, tenantID, id string, visits int) (Customer, error) {
+	if visits < 0 {
+		return Customer{}, ErrValidation
+	}
+	return svc.store.setVisits(ctx, tenantID, id, visits)
+}
+
 // Search busca clientes por nombre o teléfono (ILIKE). limit se acota a [1, 50].
 func (svc *Service) Search(ctx context.Context, tenantID, q string, limit int) ([]Customer, error) {
 	q = strings.TrimSpace(q)
