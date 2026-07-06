@@ -40,7 +40,8 @@ type createUserRequest struct {
 	Email     string   `json:"email"`
 	Password  string   `json:"password"`
 	Name      string   `json:"name"`
-	BranchIDs []string `json:"branchIds"` // 1+ sucursales del negocio (M:N)
+	Role      string   `json:"role"`      // super_admin | branch_admin | cashier | barista
+	BranchIDs []string `json:"branchIds"` // 1+ sucursales del negocio (roles de sucursal)
 }
 
 func (svc *Service) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -53,10 +54,10 @@ func (svc *Service) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
 		return
 	}
-	u, err := svc.CreateUser(r.Context(), tenantID, req.Email, req.Password, req.Name, req.BranchIDs)
+	u, err := svc.CreateUser(r.Context(), tenantID, req.Email, req.Password, req.Name, req.Role, req.BranchIDs)
 	switch {
 	case errors.Is(err, ErrValidation):
-		writeError(w, http.StatusBadRequest, "validation_error", "Email, contraseña (≥ 8) y al menos una sucursal son requeridos")
+		writeError(w, http.StatusBadRequest, "validation_error", "Email, contraseña (≥ 8), rol válido y —salvo super_admin— al menos una sucursal son requeridos")
 	case errors.Is(err, ErrBranchNotFound):
 		writeError(w, http.StatusNotFound, "branch_not_found", "Alguna sucursal no existe o no pertenece al negocio")
 	case errors.Is(err, ErrEmailTaken):
@@ -87,6 +88,14 @@ func (svc *Service) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		patch.Name = &name
+	}
+	if v, ok := raw["role"]; ok {
+		var role string
+		if err := json.Unmarshal(v, &role); err != nil {
+			writeError(w, http.StatusBadRequest, "validation_error", "role inválido")
+			return
+		}
+		patch.Role = &role
 	}
 	if v, ok := raw["branchIds"]; ok {
 		var ids []string

@@ -18,6 +18,7 @@ type User struct {
 	TenantID     *string     `json:"tenantId"` // nil solo para el super admin global
 	Email        string      `json:"email"`
 	Name         string      `json:"name"`
+	Role         string      `json:"role"` // super_admin | branch_admin | cashier | barista
 	IsSuperAdmin bool        `json:"isSuperAdmin"`
 	Status       string      `json:"status"`
 	Branches     []BranchRef `json:"branches,omitempty"` // membresías M:N (endpoints de /users)

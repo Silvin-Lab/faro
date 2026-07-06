@@ -10,16 +10,27 @@ import (
 	"faro/internal/auth"
 )
 
-// Routes se monta en /reports. Solo super admin (matriz §7): se monta con
-// requireSuperAdmin. El tenant se resuelve con ResolveTenant (businessTenantID).
-func (svc *Service) Routes(requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
+// Routes se monta en /reports. Requiere sesión; la autorización fina depende del
+// rol (M8): super admin ve todo (filtro ?branchId opcional), branch_admin queda
+// forzado a su sucursal activa, y cashier/barista reciben 403.
+func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Use(requireSuperAdmin)
+	r.Use(requireSession)
 	r.Get("/sales", svc.handleSalesReport)
 	return r
 }
 
 func (svc *Service) handleSalesReport(w http.ResponseWriter, r *http.Request) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
+	// Autorización por rol: solo super admin y branch_admin acceden a reportes.
+	if !u.IsSuperAdmin && u.Role != auth.RoleBranchAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ver reportes")
+		return
+	}
 	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
@@ -37,15 +48,26 @@ func (svc *Service) handleSalesReport(w http.ResponseWriter, r *http.Request) {
 	}
 	tz, _ := strconv.Atoi(r.URL.Query().Get("tz"))
 
-	// Filtro por sucursal: ?branchId=<uuid> acota; ?branchId=none|null es el bucket
-	// "Sin sucursal" (branch_id IS NULL); sin el param => todas.
+	// Filtro por sucursal.
 	var branch BranchFilter
-	if b := r.URL.Query().Get("branchId"); b != "" {
-		if b == "none" || b == "null" {
-			branch.None = true
-		} else {
-			branch.ID = &b
+	if u.IsSuperAdmin {
+		// Super admin: ?branchId=<uuid> acota; ?branchId=none|null es el bucket
+		// "Sin sucursal" (branch_id IS NULL); sin el param => todas.
+		if b := r.URL.Query().Get("branchId"); b != "" {
+			if b == "none" || b == "null" {
+				branch.None = true
+			} else {
+				branch.ID = &b
+			}
 		}
+	} else {
+		// branch_admin: SIEMPRE forzado a su sucursal activa; se ignora ?branchId.
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		if active == nil {
+			writeError(w, http.StatusBadRequest, "branch_required", "Selecciona una sucursal activa")
+			return
+		}
+		branch.ID = active
 	}
 
 	rep, err := svc.SalesReport(r.Context(), tenantID, from, to, tz, branch)

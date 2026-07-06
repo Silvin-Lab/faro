@@ -34,11 +34,11 @@ func (s *store) createTenantWithOwner(ctx context.Context, name, ownerEmail, own
 
 	var u User
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, password_hash, name)
-		 VALUES ($1, $2, $3, $4)
-		 RETURNING id::text, tenant_id::text, email, name, is_super_admin, status, created_at`,
+		`INSERT INTO users (tenant_id, email, password_hash, name, role)
+		 VALUES ($1, $2, $3, $4, 'branch_admin')
+		 RETURNING id::text, tenant_id::text, email, name, role, is_super_admin, status, created_at`,
 		t.ID, ownerEmail, ownerHash, ownerName).
-		Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.IsSuperAdmin, &u.Status, &u.CreatedAt); err != nil {
+		Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.Role, &u.IsSuperAdmin, &u.Status, &u.CreatedAt); err != nil {
 		if isUniqueViolation(err) {
 			return Tenant{}, User{}, ErrEmailTaken
 		}
@@ -51,8 +51,9 @@ func (s *store) createTenantWithOwner(ctx context.Context, name, ownerEmail, own
 	return t, u, nil
 }
 
-// createUser inserta el usuario y sus membresías (M:N) en una transacción.
-func (s *store) createUser(ctx context.Context, tenantID, email, name, hash string, branchIDs []string) (User, error) {
+// createUser inserta un usuario de sucursal (branch_admin/cashier/barista) con sus
+// membresías (M:N) en una transacción.
+func (s *store) createUser(ctx context.Context, tenantID, email, name, hash, role string, branchIDs []string) (User, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return User{}, err
@@ -61,11 +62,11 @@ func (s *store) createUser(ctx context.Context, tenantID, email, name, hash stri
 
 	var u User
 	err = tx.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, password_hash, name)
-		 VALUES ($1, $2, $3, $4)
-		 RETURNING id::text, tenant_id::text, email, name, is_super_admin, status, created_at`,
-		tenantID, email, hash, name).
-		Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.IsSuperAdmin, &u.Status, &u.CreatedAt)
+		`INSERT INTO users (tenant_id, email, password_hash, name, role)
+		 VALUES ($1, $2, $3, $4, $5)
+		 RETURNING id::text, tenant_id::text, email, name, role, is_super_admin, status, created_at`,
+		tenantID, email, hash, name, role).
+		Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.Role, &u.IsSuperAdmin, &u.Status, &u.CreatedAt)
 	if isUniqueViolation(err) {
 		return User{}, ErrEmailTaken
 	}
@@ -82,6 +83,22 @@ func (s *store) createUser(ctx context.Context, tenantID, email, name, hash stri
 	return u, err
 }
 
+// createSuperAdminUser inserta un super admin global (tenant NULL, is_super_admin
+// true, sin membresías). Mapea la colisión de email a ErrEmailTaken.
+func (s *store) createSuperAdminUser(ctx context.Context, email, name, hash string) (User, error) {
+	var u User
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO users (tenant_id, email, password_hash, name, role, is_super_admin)
+		 VALUES (NULL, $1, $2, $3, 'super_admin', true)
+		 RETURNING id::text, tenant_id::text, email, name, role, is_super_admin, status, created_at`,
+		email, hash, name).
+		Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.Role, &u.IsSuperAdmin, &u.Status, &u.CreatedAt)
+	if isUniqueViolation(err) {
+		return User{}, ErrEmailTaken
+	}
+	return u, err
+}
+
 // updateUser aplica el patch (name y/o membresías) a un usuario del negocio y
 // devuelve el usuario actualizado con sus branches.
 func (s *store) updateUser(ctx context.Context, tenantID, id string, patch UserPatch) (User, error) {
@@ -92,8 +109,9 @@ func (s *store) updateUser(ctx context.Context, tenantID, id string, patch UserP
 	defer tx.Rollback(ctx)
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE users SET name = COALESCE($3, name) WHERE id = $1 AND tenant_id = $2`,
-		id, tenantID, patch.Name)
+		`UPDATE users SET name = COALESCE($3, name), role = COALESCE($4, role)
+		   WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID, patch.Name, patch.Role)
 	if dberr.IsInvalidText(err) {
 		return User{}, ErrNotFound
 	}
@@ -151,7 +169,7 @@ func (s *store) countOwnedBranches(ctx context.Context, tenantID string, ids []s
 // listUsersByTenant lista usuarios del negocio con sus membresías (branches[]).
 func (s *store) listUsersByTenant(ctx context.Context, tenantID string) ([]User, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id::text, tenant_id::text, email, name, is_super_admin, status, created_at
+		`SELECT id::text, tenant_id::text, email, name, role, is_super_admin, status, created_at
 		   FROM users WHERE tenant_id = $1 ORDER BY created_at`, tenantID)
 	if err != nil {
 		return nil, err
@@ -161,7 +179,7 @@ func (s *store) listUsersByTenant(ctx context.Context, tenantID string) ([]User,
 	var users []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.IsSuperAdmin, &u.Status, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.Role, &u.IsSuperAdmin, &u.Status, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		users = append(users, u)

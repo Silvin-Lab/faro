@@ -121,7 +121,7 @@ func TestUserProvisioningM7(t *testing.T) {
 
 	// Alta de un cajero con sucursal (M:N).
 	resp := post(t, root, srv.URL+"/users", map[string]any{
-		"email": "cajero@vanta.test", "password": "secret123", "name": "Cajero", "branchIds": []string{branchID},
+		"email": "cajero@vanta.test", "password": "secret123", "name": "Cajero", "role": "cashier", "branchIds": []string{branchID},
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("crear cajero: esperaba 201, obtuvo %d", resp.StatusCode)
@@ -133,17 +133,20 @@ func TestUserProvisioningM7(t *testing.T) {
 	if len(created.User.Branches) != 1 || created.User.Branches[0].ID != branchID {
 		t.Fatalf("cajero sin membresía esperada: %+v", created.User.Branches)
 	}
+	if created.User.Role != "cashier" {
+		t.Fatalf("cajero role esperaba cashier, obtuvo %q", created.User.Role)
+	}
 
 	// branchIds vacío => 400 validation_error.
 	if resp := post(t, root, srv.URL+"/users", map[string]any{
-		"email": "x@vanta.test", "password": "secret123", "name": "X", "branchIds": []string{},
+		"email": "x@vanta.test", "password": "secret123", "name": "X", "role": "cashier", "branchIds": []string{},
 	}); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("branchIds vacío: esperaba 400, obtuvo %d", resp.StatusCode)
 	}
 
 	// Sucursal inexistente => 404 branch_not_found.
 	if resp := post(t, root, srv.URL+"/users", map[string]any{
-		"email": "y@vanta.test", "password": "secret123", "name": "Y",
+		"email": "y@vanta.test", "password": "secret123", "name": "Y", "role": "cashier",
 		"branchIds": []string{"00000000-0000-0000-0000-000000000000"},
 	}); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("sucursal inexistente: esperaba 404, obtuvo %d", resp.StatusCode)
@@ -151,7 +154,7 @@ func TestUserProvisioningM7(t *testing.T) {
 
 	// Email duplicado => 409.
 	if resp := post(t, root, srv.URL+"/users", map[string]any{
-		"email": "cajero@vanta.test", "password": "secret123", "name": "Dup", "branchIds": []string{branchID},
+		"email": "cajero@vanta.test", "password": "secret123", "name": "Dup", "role": "cashier", "branchIds": []string{branchID},
 	}); resp.StatusCode != http.StatusConflict {
 		t.Fatalf("email duplicado: esperaba 409, obtuvo %d", resp.StatusCode)
 	}
@@ -165,7 +168,7 @@ func TestUserProvisioningM7(t *testing.T) {
 	staff := jarClient(t)
 	login(t, staff, srv.URL, "cajero@vanta.test", "secret123")
 	if resp := post(t, staff, srv.URL+"/users", map[string]any{
-		"email": "z@vanta.test", "password": "secret123", "name": "Z", "branchIds": []string{branchID},
+		"email": "z@vanta.test", "password": "secret123", "name": "Z", "role": "cashier", "branchIds": []string{branchID},
 	}); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("cajero creando usuario: esperaba 403, obtuvo %d", resp.StatusCode)
 	}

@@ -19,6 +19,7 @@ var (
 // membresías (M:N) y debe traer ≥1 sucursal del negocio.
 type UserPatch struct {
 	Name      *string
+	Role      *string
 	BranchIDs *[]string
 }
 
@@ -46,23 +47,36 @@ func (svc *Service) CreateTenantWithOwner(ctx context.Context, in CreateTenantIn
 	return svc.store.createTenantWithOwner(ctx, in.Name, in.OwnerEmail, in.OwnerName, hash)
 }
 
-// CreateUser valida y crea un usuario del negocio con sus membresías (M:N). Exige
-// ≥1 sucursal, todas del tenant del negocio.
-func (svc *Service) CreateUser(ctx context.Context, tenantID, email, password, name string, branchIDs []string) (User, error) {
+// CreateUser valida y crea un usuario según su rol (M8). Un role='super_admin'
+// crea un admin global (tenant NULL, is_super_admin, sin sucursales) y NO acepta
+// branchIds. Los roles de sucursal exigen ≥1 sucursal del tenant del negocio.
+func (svc *Service) CreateUser(ctx context.Context, tenantID, email, password, name, role string, branchIDs []string) (User, error) {
 	email = strings.TrimSpace(email)
 	name = strings.TrimSpace(name)
+	role = strings.TrimSpace(role)
 	branchIDs = dedupeNonEmpty(branchIDs)
-	if name == "" || !validEmail(email) || len(password) < minPasswordLen || len(branchIDs) == 0 {
+	if name == "" || !validEmail(email) || len(password) < minPasswordLen || !validRole(role) {
 		return User{}, ErrValidation
-	}
-	if err := svc.assertBranchesOwned(ctx, tenantID, branchIDs); err != nil {
-		return User{}, err
 	}
 	hash, err := hashPassword(password)
 	if err != nil {
 		return User{}, err
 	}
-	return svc.store.createUser(ctx, tenantID, email, name, hash, branchIDs)
+	if role == RoleSuperAdmin {
+		// Identidad global: no admite membresías de sucursal.
+		if len(branchIDs) != 0 {
+			return User{}, ErrValidation
+		}
+		return svc.store.createSuperAdminUser(ctx, email, name, hash)
+	}
+	// Roles de sucursal: exigen ≥1 sucursal del negocio.
+	if len(branchIDs) == 0 {
+		return User{}, ErrValidation
+	}
+	if err := svc.assertBranchesOwned(ctx, tenantID, branchIDs); err != nil {
+		return User{}, err
+	}
+	return svc.store.createUser(ctx, tenantID, email, name, hash, role, branchIDs)
 }
 
 // UpdateUser aplica cambios (nombre y/o membresías) a un usuario del negocio. Si se
@@ -74,6 +88,16 @@ func (svc *Service) UpdateUser(ctx context.Context, tenantID, id string, patch U
 			return User{}, ErrValidation
 		}
 		patch.Name = &n
+	}
+	if patch.Role != nil {
+		r := strings.TrimSpace(*patch.Role)
+		// Solo roles de sucursal por esta vía: no se puede promover a super_admin
+		// (cambio de identidad). El super admin, además, no vive bajo un tenant, así
+		// que jamás cae en esta ruta (tenant-scoped => ErrNotFound).
+		if !isBranchRole(r) {
+			return User{}, ErrValidation
+		}
+		patch.Role = &r
 	}
 	if patch.BranchIDs != nil {
 		ids := dedupeNonEmpty(*patch.BranchIDs)

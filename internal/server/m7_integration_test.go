@@ -170,7 +170,7 @@ func TestM7V2Flow(t *testing.T) {
 
 	// Alta del cajero con 2 sucursales (M:N).
 	resp := env.do(t, root, http.MethodPost, "/users", map[string]any{
-		"email": "cajero@vanta.test", "password": "secret123", "name": "Cajero", "branchIds": []string{b1, b2},
+		"email": "cajero@vanta.test", "password": "secret123", "name": "Cajero", "role": "cashier", "branchIds": []string{b1, b2},
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /users: esperaba 201, obtuvo %d", resp.StatusCode)

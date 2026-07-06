@@ -67,8 +67,9 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 	r.Mount("/sales", salesSvc.Routes(authSvc.RequireSession))
 	// Clientes (lealtad): alta y búsqueda por teléfono.
 	r.Mount("/customers", custSvc.Routes(authSvc.RequireSession))
-	// Reportes (M5): agregados de ventas por rango (solo super admin).
-	r.Mount("/reports", reportsSvc.Routes(authSvc.RequireSuperAdmin))
+	// Reportes (M5/M8): agregados de ventas por rango. Autorización por rol dentro
+	// del handler: super admin (todas), branch_admin (su sucursal), resto 403.
+	r.Mount("/reports", reportsSvc.Routes(authSvc.RequireSession))
 	// Lealtad (M6 v2): lectura por sesión, CRUD de promociones solo super admin.
 	r.Mount("/loyalty", loyaltySvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
 	// Sucursales (M7): CRUD solo super admin.
