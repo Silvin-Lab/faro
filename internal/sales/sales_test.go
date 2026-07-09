@@ -22,6 +22,23 @@ func TestCreateValidatesInput(t *testing.T) {
 	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "cheque", 100, nil, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("forma de pago inválida: esperaba ErrValidation, obtuvo %v", err)
 	}
+	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "paypal", 100, nil, nil, nil, nil); err != ErrValidation {
+		t.Fatalf("paypal no aceptado: esperaba ErrValidation, obtuvo %v", err)
+	}
+}
+
+// TestValidPaymentMethods documenta las formas de pago aceptadas y las que no.
+func TestValidPaymentMethods(t *testing.T) {
+	for _, m := range []string{"cash", "card", "transfer", "didi"} {
+		if !isValidPaymentMethod(m) {
+			t.Fatalf("%q debería ser una forma de pago válida", m)
+		}
+	}
+	for _, m := range []string{"", "paypal", "cheque", "Card", "CASH"} {
+		if isValidPaymentMethod(m) {
+			t.Fatalf("%q no debería ser una forma de pago válida", m)
+		}
+	}
 }
 
 // --- Integración (DB real) ---
@@ -94,6 +111,37 @@ func TestCardPaymentSetsExactAmount(t *testing.T) {
 	}
 	if sale.PaymentMethod != "card" || sale.AmountPaidCents != price || sale.ChangeCents != 0 {
 		t.Fatalf("tarjeta: esperaba pagado=%d cambio=0 card, obtuvo pagado=%d cambio=%d %s", price, sale.AmountPaidCents, sale.ChangeCents, sale.PaymentMethod)
+	}
+}
+
+// TestExactPaymentMethodsPersist cubre las formas de pago sin cambio (transfer y
+// didi, con la misma semántica que card): se aceptan, el monto pagado queda igual
+// al total, el cambio es 0, y se persisten/leen bien vía Get.
+func TestExactPaymentMethodsPersist(t *testing.T) {
+	svc, pool, a, _, prodA, _, _, price := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	for _, method := range []string{"transfer", "didi"} {
+		// amountPaidCents se ignora en pagos exactos: el pagado = total, cambio = 0.
+		sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, method, 0, nil, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("venta con %s: %v", method, err)
+		}
+		if sale.PaymentMethod != method || sale.AmountPaidCents != price || sale.ChangeCents != 0 {
+			t.Fatalf("%s: esperaba pagado=%d cambio=0 método=%s, obtuvo pagado=%d cambio=%d método=%s",
+				method, price, method, sale.AmountPaidCents, sale.ChangeCents, sale.PaymentMethod)
+		}
+
+		// Round-trip: Get devuelve el mismo método persistido.
+		got, err := svc.Get(ctx, a, sale.ID)
+		if err != nil {
+			t.Fatalf("get venta %s: %v", method, err)
+		}
+		if got.PaymentMethod != method || got.AmountPaidCents != price || got.ChangeCents != 0 {
+			t.Fatalf("get %s: método=%s pagado=%d cambio=%d (esperaba %s/%d/0)",
+				method, got.PaymentMethod, got.AmountPaidCents, got.ChangeCents, method, price)
+		}
 	}
 }
 

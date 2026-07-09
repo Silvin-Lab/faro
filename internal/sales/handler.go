@@ -39,7 +39,7 @@ type lineRequest struct {
 
 type createRequest struct {
 	Items              []lineRequest `json:"items"`
-	PaymentMethod      string        `json:"paymentMethod"` // cash | card
+	PaymentMethod      string        `json:"paymentMethod"` // cash | card | transfer | didi
 	AmountPaidCents    int           `json:"amountPaidCents"`
 	CustomerID         *string       `json:"customerId"`
 	PromotionID        *string       `json:"promotionId"`        // a lo sumo una promoción

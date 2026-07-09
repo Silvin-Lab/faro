@@ -271,6 +271,48 @@ func TestM7V2Flow(t *testing.T) {
 		t.Fatalf("GET /sales en b2 esperaba 1 venta de b2, obtuvo %+v", listB2.Items)
 	}
 
+	// --- Formas de pago ampliadas: transfer y didi (pago exacto, como card) ----
+	for _, method := range []string{"transfer", "didi"} {
+		resp = env.do(t, cajero, http.MethodPost, "/sales", map[string]any{
+			"items": []map[string]any{{"productId": env.productA, "quantity": 1}}, "paymentMethod": method, "amountPaidCents": 0,
+		})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("POST /sales %s: esperaba 201, obtuvo %d", method, resp.StatusCode)
+		}
+		decode(t, resp, &sc)
+		if sc.Sale.PaymentMethod != method || sc.Sale.ChangeCents != 0 {
+			t.Fatalf("venta %s: esperaba método=%s cambio=0, obtuvo método=%s cambio=%d", method, method, sc.Sale.PaymentMethod, sc.Sale.ChangeCents)
+		}
+	}
+	// GET /sales en b2 ahora refleja las 3 ventas (card + transfer + didi) y persiste el método.
+	resp = env.do(t, cajero, http.MethodGet, "/sales", nil)
+	var listPM struct {
+		Items []sales.Sale `json:"items"`
+	}
+	decode(t, resp, &listPM)
+	methods := map[string]bool{}
+	for _, s := range listPM.Items {
+		methods[s.PaymentMethod] = true
+	}
+	if len(listPM.Items) != 3 || !methods["card"] || !methods["transfer"] || !methods["didi"] {
+		t.Fatalf("GET /sales b2 esperaba 3 ventas con card/transfer/didi, obtuvo %+v", listPM.Items)
+	}
+
+	// Método no aceptado (paypal) => 400 validation_error.
+	resp = env.do(t, cajero, http.MethodPost, "/sales", map[string]any{
+		"items": []map[string]any{{"productId": env.productA, "quantity": 1}}, "paymentMethod": "paypal", "amountPaidCents": 0,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /sales paypal: esperaba 400, obtuvo %d", resp.StatusCode)
+	}
+	var perr struct {
+		Code string `json:"code"`
+	}
+	decode(t, resp, &perr)
+	if perr.Code != "validation_error" {
+		t.Fatalf("POST /sales paypal: esperaba code validation_error, obtuvo %q", perr.Code)
+	}
+
 	// --- Autorización: el cajero NO accede a admin ----------------------------
 	if resp := env.do(t, cajero, http.MethodPost, "/branches", map[string]string{"name": "Hack"}); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("cajero POST /branches: esperaba 403, obtuvo %d", resp.StatusCode)

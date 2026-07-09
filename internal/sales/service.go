@@ -11,6 +11,22 @@ import (
 
 var ErrValidation = errors.New("validation")
 
+// validPaymentMethods son las formas de pago aceptadas. "cash" cobra con cambio;
+// el resto (card, transfer, didi) se cobran por el monto exacto, sin cambio.
+var validPaymentMethods = map[string]bool{
+	"cash":     true,
+	"card":     true,
+	"transfer": true,
+	"didi":     true,
+}
+
+// isValidPaymentMethod indica si la forma de pago está permitida.
+func isValidPaymentMethod(m string) bool { return validPaymentMethods[m] }
+
+// isExactPaymentMethod indica si el método se cobra por el total exacto (sin
+// cambio): todo lo que no sea efectivo. Fuente única para el cálculo del cambio.
+func isExactPaymentMethod(m string) bool { return m != "cash" }
+
 // LineInput es una línea solicitada por el cliente (producto + cantidad).
 type LineInput struct {
 	ProductID string
@@ -32,7 +48,7 @@ func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInp
 	if len(items) == 0 || amountPaidCents < 0 {
 		return Sale{}, ErrValidation
 	}
-	if paymentMethod != "cash" && paymentMethod != "card" {
+	if !isValidPaymentMethod(paymentMethod) {
 		return Sale{}, ErrValidation
 	}
 	customerID = nilIfBlank(customerID)

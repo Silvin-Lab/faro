@@ -23,7 +23,7 @@ type Sale struct {
 	ChangeCents     int        `json:"changeCents"`
 	DiscountCents   int        `json:"discountCents"` // descuento de lealtad calculado en servidor
 	PromotionName   *string    `json:"promotionName"` // nombre de la promo aplicada (o null)
-	PaymentMethod   string     `json:"paymentMethod"` // cash | card
+	PaymentMethod   string     `json:"paymentMethod"` // cash | card | transfer | didi
 	CustomerID      *string    `json:"customerId"`
 	CustomerName    *string    `json:"customerName"`
 	BranchID        *string    `json:"branchId"`   // sucursal derivada del usuario (nullable)

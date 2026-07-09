@@ -154,10 +154,10 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 
 	total = subtotal - discountCents
 
-	// Tarjeta: el monto pagado es exactamente el total (sin cambio).
-	// Efectivo: se valida que alcance y se calcula el cambio.
+	// Pago exacto (tarjeta, transferencia, didi): el monto pagado es exactamente
+	// el total (sin cambio). Efectivo: se valida que alcance y se calcula el cambio.
 	var amountPaid, change int
-	if paymentMethod == "card" {
+	if isExactPaymentMethod(paymentMethod) {
 		amountPaid = total
 		change = 0
 	} else {
