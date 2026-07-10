@@ -42,8 +42,8 @@ func setup(t *testing.T) *fixture {
 	}
 	if _, err := pool.Exec(ctx,
 		`TRUNCATE supply_movements, supply_branch_stock, product_supplies, supplies,
-		 sale_items, sales, user_branches, products, categories, customers, users,
-		 branches, tenants RESTART IDENTITY CASCADE`); err != nil {
+		 supply_categories, sale_items, sales, user_branches, products, categories,
+		 customers, users, branches, tenants RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -92,6 +92,204 @@ func (f *fixture) cacheStock(t *testing.T, supplyID, branchID string) int {
 	return stock
 }
 
+// TestSupplyCategoryCRUD cubre el catálogo de categorías de insumo: creación,
+// name_taken, categoría ajena (not found en update), y actualización parcial.
+func TestSupplyCategoryCRUD(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	c, err := f.svc.CreateCategory(ctx, f.tenantA, "  Lácteos  ", 2)
+	if err != nil {
+		t.Fatalf("crear categoría: %v", err)
+	}
+	if c.Name != "Lácteos" || c.Status != "active" || c.SortOrder != 2 {
+		t.Fatalf("categoría inesperada: %+v", c)
+	}
+
+	// Nombre vacío -> validación.
+	if _, err := f.svc.CreateCategory(ctx, f.tenantA, "   ", 0); !errors.Is(err, ErrValidation) {
+		t.Fatalf("nombre vacío: esperaba ErrValidation, obtuvo %v", err)
+	}
+	// Duplicado -> name_taken.
+	if _, err := f.svc.CreateCategory(ctx, f.tenantA, "Lácteos", 0); !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("nombre duplicado: esperaba ErrNameTaken, obtuvo %v", err)
+	}
+
+	// Listado ordenado por sort_order, name.
+	if _, err := f.svc.CreateCategory(ctx, f.tenantA, "Abarrotes", 1); err != nil {
+		t.Fatalf("crear 2ª categoría: %v", err)
+	}
+	items, err := f.svc.ListCategories(ctx, f.tenantA)
+	if err != nil {
+		t.Fatalf("list categorías: %v", err)
+	}
+	if len(items) != 2 || items[0].Name != "Abarrotes" || items[1].Name != "Lácteos" {
+		t.Fatalf("orden inesperado: %+v", items)
+	}
+
+	// Update parcial: renombrar + inactivar.
+	newName := "Lácteos y quesos"
+	inactive := "inactive"
+	upd, err := f.svc.UpdateCategory(ctx, f.tenantA, c.ID, CategoryUpdate{Name: &newName, Status: &inactive})
+	if err != nil {
+		t.Fatalf("update categoría: %v", err)
+	}
+	if upd.Name != "Lácteos y quesos" || upd.Status != "inactive" || upd.SortOrder != 2 {
+		t.Fatalf("update inesperado: %+v", upd)
+	}
+
+	// Status ilegal -> validación.
+	bad := "archived"
+	if _, err := f.svc.UpdateCategory(ctx, f.tenantA, c.ID, CategoryUpdate{Status: &bad}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("status ilegal: esperaba ErrValidation, obtuvo %v", err)
+	}
+	// Categoría de otro tenant -> not found.
+	if _, err := f.svc.UpdateCategory(ctx, f.tenantB, c.ID, CategoryUpdate{Name: &newName}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update cross-tenant: esperaba ErrNotFound, obtuvo %v", err)
+	}
+	// Tenant B no ve las categorías de A.
+	itemsB, _ := f.svc.ListCategories(ctx, f.tenantB)
+	if len(itemsB) != 0 {
+		t.Fatalf("aislamiento: tenant B esperaba 0 categorías, obtuvo %d", len(itemsB))
+	}
+}
+
+// TestSupplyWithCategory cubre crear insumo con categoría (categoryName en la
+// respuesta), sin categoría (null), categoría ajena (invalid_category), PATCH que
+// reasigna categoría, y que list/get devuelven categoryName.
+func TestSupplyWithCategory(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	cat, _ := f.svc.CreateCategory(ctx, f.tenantA, "Lácteos", 0)
+
+	// Crear CON categoría: categoryId/categoryName en la respuesta.
+	withCat, err := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, nil, &cat.ID)
+	if err != nil {
+		t.Fatalf("crear con categoría: %v", err)
+	}
+	if withCat.CategoryID == nil || *withCat.CategoryID != cat.ID {
+		t.Fatalf("crear con categoría: categoryId esperaba %s, obtuvo %v", cat.ID, withCat.CategoryID)
+	}
+	if withCat.CategoryName == nil || *withCat.CategoryName != "Lácteos" {
+		t.Fatalf("crear con categoría: categoryName esperaba Lácteos, obtuvo %v", withCat.CategoryName)
+	}
+
+	// Crear SIN categoría: null (cadena vacía se normaliza a nil).
+	noCat, err := f.svc.Create(ctx, f.tenantA, "Azúcar", "g", "Bolsa", 1000, nil, nil)
+	if err != nil {
+		t.Fatalf("crear sin categoría: %v", err)
+	}
+	if noCat.CategoryID != nil || noCat.CategoryName != nil {
+		t.Fatalf("crear sin categoría: esperaba null, obtuvo id=%v name=%v", noCat.CategoryID, noCat.CategoryName)
+	}
+	empty := "   "
+	blankCat, err := f.svc.Create(ctx, f.tenantA, "Sal", "g", "Bolsa", 500, nil, &empty)
+	if err != nil {
+		t.Fatalf("crear con categoría en blanco: %v", err)
+	}
+	if blankCat.CategoryID != nil {
+		t.Fatalf("categoría en blanco: esperaba null, obtuvo %v", blankCat.CategoryID)
+	}
+
+	// Categoría de OTRO tenant -> invalid_category.
+	catB, _ := f.svc.CreateCategory(ctx, f.tenantB, "CategoríaB", 0)
+	if _, err := f.svc.Create(ctx, f.tenantA, "Café", "g", "Bolsa", 1000, nil, &catB.ID); !errors.Is(err, ErrInvalidCategory) {
+		t.Fatalf("categoría ajena en create: esperaba ErrInvalidCategory, obtuvo %v", err)
+	}
+
+	// GET round-trip: la categoría persiste.
+	gotWith, _ := f.svc.Get(ctx, f.tenantA, withCat.ID)
+	if gotWith.CategoryName == nil || *gotWith.CategoryName != "Lácteos" {
+		t.Fatalf("GET con categoría: esperaba Lácteos, obtuvo %v", gotWith.CategoryName)
+	}
+	gotNo, _ := f.svc.Get(ctx, f.tenantA, noCat.ID)
+	if gotNo.CategoryName != nil {
+		t.Fatalf("GET sin categoría: esperaba null, obtuvo %v", gotNo.CategoryName)
+	}
+
+	// PATCH que ASIGNA categoría a un insumo que no la tenía (Azúcar -> Lácteos).
+	reassigned, err := f.svc.Update(ctx, f.tenantA, noCat.ID, UpdateInput{CategoryID: &cat.ID})
+	if err != nil {
+		t.Fatalf("PATCH asigna categoría: %v", err)
+	}
+	if reassigned.CategoryID == nil || *reassigned.CategoryID != cat.ID || reassigned.CategoryName == nil || *reassigned.CategoryName != "Lácteos" {
+		t.Fatalf("PATCH asigna: esperaba Lácteos, obtuvo id=%v name=%v", reassigned.CategoryID, reassigned.CategoryName)
+	}
+
+	// PATCH que REASIGNA a otra categoría.
+	cat2, _ := f.svc.CreateCategory(ctx, f.tenantA, "Abarrotes", 0)
+	reassigned2, err := f.svc.Update(ctx, f.tenantA, noCat.ID, UpdateInput{CategoryID: &cat2.ID})
+	if err != nil {
+		t.Fatalf("PATCH reasigna categoría: %v", err)
+	}
+	if reassigned2.CategoryName == nil || *reassigned2.CategoryName != "Abarrotes" {
+		t.Fatalf("PATCH reasigna: esperaba Abarrotes, obtuvo %v", reassigned2.CategoryName)
+	}
+
+	// PATCH sin categoryId (nil) NO cambia la categoría (puntero nil = no toca).
+	other := "Azúcar refinada"
+	unchanged, err := f.svc.Update(ctx, f.tenantA, noCat.ID, UpdateInput{Name: &other})
+	if err != nil {
+		t.Fatalf("PATCH sin categoría: %v", err)
+	}
+	if unchanged.CategoryName == nil || *unchanged.CategoryName != "Abarrotes" {
+		t.Fatalf("PATCH sin categoría: esperaba conservar Abarrotes, obtuvo %v", unchanged.CategoryName)
+	}
+
+	// PATCH con categoría ajena -> invalid_category.
+	if _, err := f.svc.Update(ctx, f.tenantA, noCat.ID, UpdateInput{CategoryID: &catB.ID}); !errors.Is(err, ErrInvalidCategory) {
+		t.Fatalf("categoría ajena en update: esperaba ErrInvalidCategory, obtuvo %v", err)
+	}
+
+	// LIST devuelve categoryName por insumo (orden por nombre: Azúcar, Café..., Leche, Sal).
+	items, _ := f.svc.List(ctx, f.tenantA)
+	byName := map[string]*string{}
+	for _, it := range items {
+		byName[it.Name] = it.CategoryName
+	}
+	if byName["Leche"] == nil || *byName["Leche"] != "Lácteos" {
+		t.Fatalf("LIST Leche: esperaba Lácteos, obtuvo %v", byName["Leche"])
+	}
+	if byName["Sal"] != nil {
+		t.Fatalf("LIST Sal: esperaba null, obtuvo %v", byName["Sal"])
+	}
+}
+
+// TestSupplyCategoryOnDeleteSetNull verifica el FK ON DELETE SET NULL: borrar una
+// categoría (vía SQL directo, no hay endpoint DELETE) deja los insumos con
+// category_id NULL, sin borrarlos.
+func TestSupplyCategoryOnDeleteSetNull(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	cat, _ := f.svc.CreateCategory(ctx, f.tenantA, "Lácteos", 0)
+	sp, err := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote", 900, nil, &cat.ID)
+	if err != nil {
+		t.Fatalf("crear insumo: %v", err)
+	}
+	if sp.CategoryID == nil {
+		t.Fatalf("precondición: el insumo debía tener categoría")
+	}
+
+	// Borrar la categoría por SQL directo.
+	if _, err := f.pool.Exec(ctx, `DELETE FROM supply_categories WHERE id = $1`, cat.ID); err != nil {
+		t.Fatalf("borrar categoría: %v", err)
+	}
+
+	// El insumo sigue existiendo pero SIN categoría (category_id NULL).
+	got, err := f.svc.Get(ctx, f.tenantA, sp.ID)
+	if err != nil {
+		t.Fatalf("get tras borrar categoría: %v", err)
+	}
+	if got.CategoryID != nil || got.CategoryName != nil {
+		t.Fatalf("ON DELETE SET NULL: esperaba categoría null, obtuvo id=%v name=%v", got.CategoryID, got.CategoryName)
+	}
+}
+
 // TestCatalogCRUD cubre create/update, base_unit inválida e inmutable,
 // package_content <= 0 y name_taken.
 func TestCatalogCRUD(t *testing.T) {
@@ -99,7 +297,7 @@ func TestCatalogCRUD(t *testing.T) {
 	defer f.pool.Close()
 	ctx := context.Background()
 
-	sp, err := f.svc.Create(ctx, f.tenantA, "  Leche  ", "ml", "Bote 900 ml", 900, nil)
+	sp, err := f.svc.Create(ctx, f.tenantA, "  Leche  ", "ml", "Bote 900 ml", 900, nil, nil)
 	if err != nil {
 		t.Fatalf("crear insumo: %v", err)
 	}
@@ -108,18 +306,18 @@ func TestCatalogCRUD(t *testing.T) {
 	}
 
 	// base_unit inválida -> validación.
-	if _, err := f.svc.Create(ctx, f.tenantA, "Azucar", "kg", "Bolsa", 1000, nil); !errors.Is(err, ErrValidation) {
+	if _, err := f.svc.Create(ctx, f.tenantA, "Azucar", "kg", "Bolsa", 1000, nil, nil); !errors.Is(err, ErrValidation) {
 		t.Fatalf("base_unit inválida: esperaba ErrValidation, obtuvo %v", err)
 	}
 	// package_content <= 0 -> validación.
-	if _, err := f.svc.Create(ctx, f.tenantA, "Sal", "g", "Bolsa", 0, nil); !errors.Is(err, ErrValidation) {
+	if _, err := f.svc.Create(ctx, f.tenantA, "Sal", "g", "Bolsa", 0, nil, nil); !errors.Is(err, ErrValidation) {
 		t.Fatalf("package_content 0: esperaba ErrValidation, obtuvo %v", err)
 	}
-	if _, err := f.svc.Create(ctx, f.tenantA, "Sal", "g", "Bolsa", -5, nil); !errors.Is(err, ErrValidation) {
+	if _, err := f.svc.Create(ctx, f.tenantA, "Sal", "g", "Bolsa", -5, nil, nil); !errors.Is(err, ErrValidation) {
 		t.Fatalf("package_content negativo: esperaba ErrValidation, obtuvo %v", err)
 	}
 	// name_taken.
-	if _, err := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Otro", 500, nil); !errors.Is(err, ErrNameTaken) {
+	if _, err := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Otro", 500, nil, nil); !errors.Is(err, ErrNameTaken) {
 		t.Fatalf("nombre duplicado: esperaba ErrNameTaken, obtuvo %v", err)
 	}
 
@@ -165,7 +363,7 @@ func TestPackageCost(t *testing.T) {
 
 	// Crear CON costo: "Bote 900 ml" cuesta $85.00 -> 8500 centavos.
 	cost := 8500
-	withCost, err := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, &cost)
+	withCost, err := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, &cost, nil)
 	if err != nil {
 		t.Fatalf("crear con costo: %v", err)
 	}
@@ -174,7 +372,7 @@ func TestPackageCost(t *testing.T) {
 	}
 
 	// Crear SIN costo: nil = no capturado (NO 0).
-	noCost, err := f.svc.Create(ctx, f.tenantA, "Azúcar", "g", "Bolsa 1kg", 1000, nil)
+	noCost, err := f.svc.Create(ctx, f.tenantA, "Azúcar", "g", "Bolsa 1kg", 1000, nil, nil)
 	if err != nil {
 		t.Fatalf("crear sin costo: %v", err)
 	}
@@ -227,7 +425,7 @@ func TestPackageCost(t *testing.T) {
 
 	// Costo negativo en CREATE -> validation_error.
 	neg := -1
-	if _, err := f.svc.Create(ctx, f.tenantA, "Sal", "g", "Bolsa", 500, &neg); !errors.Is(err, ErrValidation) {
+	if _, err := f.svc.Create(ctx, f.tenantA, "Sal", "g", "Bolsa", 500, &neg, nil); !errors.Is(err, ErrValidation) {
 		t.Fatalf("crear costo negativo: esperaba ErrValidation, obtuvo %v", err)
 	}
 	// Costo negativo en UPDATE -> validation_error.
@@ -237,7 +435,7 @@ func TestPackageCost(t *testing.T) {
 
 	// Costo 0 es un costo VÁLIDO (gratis), distinto de null (desconocido).
 	zero := 0
-	free, err := f.svc.Create(ctx, f.tenantA, "Agua", "ml", "Garrafón", 20000, &zero)
+	free, err := f.svc.Create(ctx, f.tenantA, "Agua", "ml", "Garrafón", 20000, &zero, nil)
 	if err != nil {
 		t.Fatalf("crear costo 0: %v", err)
 	}
@@ -253,7 +451,7 @@ func TestPurchaseMovement(t *testing.T) {
 	defer f.pool.Close()
 	ctx := context.Background()
 
-	sp, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, nil)
+	sp, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, nil, nil)
 
 	packages := 2
 	m, stock, err := f.svc.CreateMovement(ctx, f.tenantA, sp.ID, MovementInput{
@@ -312,7 +510,7 @@ func TestAdjustmentMovement(t *testing.T) {
 	defer f.pool.Close()
 	ctx := context.Background()
 
-	sp, _ := f.svc.Create(ctx, f.tenantA, "Galletas", "pieza", "Caja 24", 24, nil)
+	sp, _ := f.svc.Create(ctx, f.tenantA, "Galletas", "pieza", "Caja 24", 24, nil, nil)
 
 	// Ajuste positivo con motivo.
 	up := 24
@@ -375,7 +573,7 @@ func TestMovementBranchValidation(t *testing.T) {
 	defer f.pool.Close()
 	ctx := context.Background()
 
-	sp, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote", 900, nil)
+	sp, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote", 900, nil, nil)
 	packages := 1
 
 	// branchId vacío -> validación.
@@ -412,7 +610,7 @@ func TestListStock(t *testing.T) {
 	defer f.pool.Close()
 	ctx := context.Background()
 
-	sp, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, nil)
+	sp, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, nil, nil)
 	packages := 2
 	f.svc.CreateMovement(ctx, f.tenantA, sp.ID, MovementInput{Type: "purchase", BranchID: f.branchA1, Packages: &packages}, f.userA)
 
@@ -445,9 +643,9 @@ func TestRecipeReplaceAll(t *testing.T) {
 	defer f.pool.Close()
 	ctx := context.Background()
 
-	leche, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote", 900, nil)
-	cafe, _ := f.svc.Create(ctx, f.tenantA, "Café", "g", "Bolsa", 1000, nil)
-	azucar, _ := f.svc.Create(ctx, f.tenantA, "Azúcar", "g", "Bolsa", 1000, nil)
+	leche, _ := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote", 900, nil, nil)
+	cafe, _ := f.svc.Create(ctx, f.tenantA, "Café", "g", "Bolsa", 1000, nil, nil)
+	azucar, _ := f.svc.Create(ctx, f.tenantA, "Azúcar", "g", "Bolsa", 1000, nil, nil)
 
 	// Receta inicial: leche 200 + café 18.
 	out, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
@@ -478,7 +676,7 @@ func TestRecipeReplaceAll(t *testing.T) {
 	}
 
 	// Insumo de OTRO tenant -> invalid_supply (y la receta previa NO se destruye: la tx aborta).
-	supB, _ := f.svc.Create(ctx, f.tenantB, "InsumoB", "g", "Bolsa", 500, nil)
+	supB, _ := f.svc.Create(ctx, f.tenantB, "InsumoB", "g", "Bolsa", 500, nil, nil)
 	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
 		{SupplyID: supB.ID, QuantityBase: 5},
 	}); !errors.Is(err, ErrInvalidSupply) {

@@ -13,6 +13,18 @@ package supplies
 
 import "time"
 
+// SupplyCategory es una categoría de insumo (tipo de insumo), espejo de
+// expenses.Category / expense_categories: CRUD tenant-scoped, administrada por super
+// admin. La relación insumo→categoría es OPCIONAL (un insumo puede no tener categoría).
+type SupplyCategory struct {
+	ID        string    `json:"id"`
+	TenantID  string    `json:"tenantId"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	SortOrder int       `json:"sortOrder"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 // Supply es un insumo del catálogo. base_unit es INMUTABLE tras la creación.
 // package_content = contenido de UNA presentación en unidad base. Stock se llena
 // solo en el listado (existencias por sucursal); en create/get/update va como
@@ -21,6 +33,9 @@ import "time"
 // PackageCostCents = costo de UNA presentación en centavos (ej. "Bote 900 ml" a
 // $85.00 -> 8500). Puntero: nil / JSON null = costo no capturado (desconocido); no
 // se usa 0 como "desconocido" (0 sería un costo real de cero).
+//
+// CategoryID/CategoryName son OPCIONALES (nil / JSON null = "Sin categoría"). Se
+// derivan por LEFT JOIN a supply_categories en list/get/create/update.
 type Supply struct {
 	ID               string        `json:"id"`
 	TenantID         string        `json:"tenantId"`
@@ -29,6 +44,8 @@ type Supply struct {
 	PackageName      string        `json:"packageName"`
 	PackageContent   int           `json:"packageContent"`
 	PackageCostCents *int          `json:"packageCostCents"` // centavos; null = desconocido
+	CategoryID       *string       `json:"categoryId"`       // null = sin categoría
+	CategoryName     *string       `json:"categoryName"`     // null = sin categoría
 	Status           string        `json:"status"`
 	CreatedAt        time.Time     `json:"createdAt"`
 	Stock            []BranchStock `json:"stock"`

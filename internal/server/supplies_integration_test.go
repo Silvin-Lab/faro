@@ -139,3 +139,136 @@ func TestSuppliesHTTP(t *testing.T) {
 
 	_ = b2
 }
+
+// TestSupplyCategoriesHTTP cubre el sub-recurso /supplies/categories: authz (cajero
+// 403 en escritura, lectura OK), que la respuesta de POST devuelve la categoría
+// completa (creación inline en el frontend), el ruteo estático (GET
+// /supplies/categories NO cae en handleGet y GET /supplies/{uuid} sigue funcionando)
+// y crear un insumo con categoryId (categoryName en la respuesta).
+func TestSupplyCategoriesHTTP(t *testing.T) {
+	env := setupM7(t)
+	defer env.close()
+
+	root := newClient(t)
+	env.login(t, root, "root@faro.test", "secret123")
+
+	b1 := env.createBranch(t, root, "Centro")
+	env.newBranchUser(t, root, "cajero@vanta.test", "cashier", []string{b1})
+	cashier := newClient(t)
+	env.login(t, cashier, "cajero@vanta.test", "secret123")
+
+	// --- Super admin crea una categoría: 201 con la categoría COMPLETA -----------
+	resp := env.do(t, root, http.MethodPost, "/supplies/categories", map[string]any{
+		"name": "Lácteos", "sortOrder": 2,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /supplies/categories: esperaba 201, obtuvo %d", resp.StatusCode)
+	}
+	var cat struct {
+		Category struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			Status    string `json:"status"`
+			SortOrder int    `json:"sortOrder"`
+		} `json:"category"`
+	}
+	decode(t, resp, &cat)
+	if cat.Category.ID == "" || cat.Category.Name != "Lácteos" || cat.Category.Status != "active" || cat.Category.SortOrder != 2 {
+		t.Fatalf("categoría creada incompleta: %+v", cat.Category)
+	}
+
+	// name_taken -> 409.
+	if resp := env.do(t, root, http.MethodPost, "/supplies/categories", map[string]any{"name": "Lácteos"}); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("categoría duplicada: esperaba 409, obtuvo %d", resp.StatusCode)
+	}
+
+	// --- Authz: cajero 403 en POST/PATCH categorías -----------------------------
+	if resp := env.do(t, cashier, http.MethodPost, "/supplies/categories", map[string]any{"name": "Hack"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cajero POST categorías: esperaba 403, obtuvo %d", resp.StatusCode)
+	}
+	if resp := env.do(t, cashier, http.MethodPatch, "/supplies/categories/"+cat.Category.ID, map[string]any{"name": "Hack"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cajero PATCH categorías: esperaba 403, obtuvo %d", resp.StatusCode)
+	}
+
+	// --- Ruteo estático: GET /supplies/categories NO cae en handleGet -----------
+	// (handleGet devolvería 404 not_found por un uuid inválido "categories").
+	resp = env.do(t, cashier, http.MethodGet, "/supplies/categories", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /supplies/categories: esperaba 200, obtuvo %d", resp.StatusCode)
+	}
+	var list struct {
+		Items []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"items"`
+	}
+	decode(t, resp, &list)
+	if len(list.Items) != 1 || list.Items[0].Name != "Lácteos" {
+		t.Fatalf("GET /supplies/categories: esperaba [Lácteos], obtuvo %+v", list.Items)
+	}
+
+	// --- PATCH categoría: renombra + reordena -----------------------------------
+	resp = env.do(t, root, http.MethodPatch, "/supplies/categories/"+cat.Category.ID, map[string]any{
+		"name": "Lácteos y quesos", "sortOrder": 5,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH categoría: esperaba 200, obtuvo %d", resp.StatusCode)
+	}
+	decode(t, resp, &cat)
+	if cat.Category.Name != "Lácteos y quesos" || cat.Category.SortOrder != 5 {
+		t.Fatalf("PATCH categoría inesperado: %+v", cat.Category)
+	}
+	// PATCH categoría inexistente -> 404.
+	if resp := env.do(t, root, http.MethodPatch, "/supplies/categories/00000000-0000-0000-0000-000000000000", map[string]any{"name": "X"}); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("PATCH categoría inexistente: esperaba 404, obtuvo %d", resp.StatusCode)
+	}
+
+	// --- Crear insumo CON categoría: categoryId/categoryName en la respuesta -----
+	resp = env.do(t, root, http.MethodPost, "/supplies", map[string]any{
+		"name": "Leche", "baseUnit": "ml", "packageName": "Bote 900 ml", "packageContent": 900,
+		"categoryId": cat.Category.ID,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /supplies con categoría: esperaba 201, obtuvo %d", resp.StatusCode)
+	}
+	var sup struct {
+		Supply struct {
+			ID           string  `json:"id"`
+			CategoryID   *string `json:"categoryId"`
+			CategoryName *string `json:"categoryName"`
+		} `json:"supply"`
+	}
+	decode(t, resp, &sup)
+	if sup.Supply.CategoryID == nil || *sup.Supply.CategoryID != cat.Category.ID {
+		t.Fatalf("insumo con categoría: categoryId inesperado %+v", sup.Supply.CategoryID)
+	}
+	if sup.Supply.CategoryName == nil || *sup.Supply.CategoryName != "Lácteos y quesos" {
+		t.Fatalf("insumo con categoría: categoryName esperaba 'Lácteos y quesos', obtuvo %v", sup.Supply.CategoryName)
+	}
+
+	// --- El ruteo /{id} sigue vivo: GET /supplies/{uuid} devuelve el insumo ------
+	resp = env.do(t, cashier, http.MethodGet, "/supplies/"+sup.Supply.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /supplies/{uuid}: esperaba 200, obtuvo %d", resp.StatusCode)
+	}
+	decode(t, resp, &sup)
+	if sup.Supply.CategoryName == nil || *sup.Supply.CategoryName != "Lácteos y quesos" {
+		t.Fatalf("GET /supplies/{uuid}: categoryName esperaba 'Lácteos y quesos', obtuvo %v", sup.Supply.CategoryName)
+	}
+
+	// --- Categoría ajena/inexistente en create -> 400 invalid_category ----------
+	resp = env.do(t, root, http.MethodPost, "/supplies", map[string]any{
+		"name": "Café", "baseUnit": "g", "packageName": "Bolsa", "packageContent": 1000,
+		"categoryId": "00000000-0000-0000-0000-000000000000",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("categoría inválida en create: esperaba 400, obtuvo %d", resp.StatusCode)
+	}
+	var perr struct {
+		Code string `json:"code"`
+	}
+	decode(t, resp, &perr)
+	if perr.Code != "invalid_category" {
+		t.Fatalf("categoría inválida: esperaba code invalid_category, obtuvo %q", perr.Code)
+	}
+}

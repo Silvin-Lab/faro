@@ -25,11 +25,48 @@ func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{store: newStore(pool)}
 }
 
+// ---- Categorías de insumo --------------------------------------------------
+
+func (svc *Service) CreateCategory(ctx context.Context, tenantID, name string, sortOrder int) (SupplyCategory, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return SupplyCategory{}, ErrValidation
+	}
+	return svc.store.createCategory(ctx, tenantID, name, sortOrder)
+}
+
+func (svc *Service) ListCategories(ctx context.Context, tenantID string) ([]SupplyCategory, error) {
+	return svc.store.listCategories(ctx, tenantID)
+}
+
+// CategoryUpdate agrupa los cambios parciales de una categoría (nil = no cambia).
+type CategoryUpdate struct {
+	Name      *string
+	Status    *string
+	SortOrder *int
+}
+
+func (svc *Service) UpdateCategory(ctx context.Context, tenantID, id string, in CategoryUpdate) (SupplyCategory, error) {
+	if in.Name != nil {
+		n := strings.TrimSpace(*in.Name)
+		if n == "" {
+			return SupplyCategory{}, ErrValidation
+		}
+		in.Name = &n
+	}
+	if in.Status != nil && *in.Status != "active" && *in.Status != "inactive" {
+		return SupplyCategory{}, ErrValidation
+	}
+	return svc.store.updateCategory(ctx, tenantID, id, in.Name, in.Status, in.SortOrder)
+}
+
 // ---- Catálogo --------------------------------------------------------------
 
 // Create registra un insumo. packageCostCents es OPCIONAL (nil = costo no
-// capturado); si viene, debe ser >= 0 (validation_error).
-func (svc *Service) Create(ctx context.Context, tenantID, name, baseUnit, packageName string, packageContent int, packageCostCents *int) (Supply, error) {
+// capturado); si viene, debe ser >= 0 (validation_error). categoryID es OPCIONAL
+// (nil / "" = sin categoría); si viene, debe ser una categoría del tenant
+// (invalid_category).
+func (svc *Service) Create(ctx context.Context, tenantID, name, baseUnit, packageName string, packageContent int, packageCostCents *int, categoryID *string) (Supply, error) {
 	name = strings.TrimSpace(name)
 	packageName = strings.TrimSpace(packageName)
 	if name == "" || packageName == "" {
@@ -44,7 +81,17 @@ func (svc *Service) Create(ctx context.Context, tenantID, name, baseUnit, packag
 	if packageCostCents != nil && *packageCostCents < 0 {
 		return Supply{}, ErrValidation
 	}
-	return svc.store.create(ctx, tenantID, name, baseUnit, packageName, packageContent, packageCostCents)
+	categoryID = normalizeID(categoryID)
+	if categoryID != nil {
+		ok, err := svc.store.categoryExists(ctx, tenantID, *categoryID)
+		if err != nil {
+			return Supply{}, err
+		}
+		if !ok {
+			return Supply{}, ErrInvalidCategory
+		}
+	}
+	return svc.store.create(ctx, tenantID, name, baseUnit, packageName, packageContent, packageCostCents, categoryID)
 }
 
 func (svc *Service) List(ctx context.Context, tenantID string) ([]Supply, error) {
@@ -64,6 +111,7 @@ type UpdateInput struct {
 	PackageContent   *int
 	PackageCostCents *int    // nil = no cambia; si viene, >= 0
 	BaseUnit         *string // presente en el PATCH => intento ilegal de mutar la unidad
+	CategoryID       *string // presente => asigna esa categoría (validada); ausente = no cambia
 }
 
 func (svc *Service) Update(ctx context.Context, tenantID, id string, in UpdateInput) (Supply, error) {
@@ -95,7 +143,20 @@ func (svc *Service) Update(ctx context.Context, tenantID, id string, in UpdateIn
 	if in.Status != nil && *in.Status != "active" && *in.Status != "inactive" {
 		return Supply{}, ErrValidation
 	}
-	return svc.store.update(ctx, tenantID, id, in.Name, in.Status, in.PackageName, in.PackageContent, in.PackageCostCents)
+	// Categoría: presente => asigna (validando tenant); ausente/"" => no cambia. NO se
+	// puede desasignar a null vía PATCH (se reasigna a otra); ver decisión en el plan.
+	catID := normalizeID(in.CategoryID)
+	setCategory := catID != nil
+	if setCategory {
+		ok, err := svc.store.categoryExists(ctx, tenantID, *catID)
+		if err != nil {
+			return Supply{}, err
+		}
+		if !ok {
+			return Supply{}, ErrInvalidCategory
+		}
+	}
+	return svc.store.update(ctx, tenantID, id, in.Name, in.Status, in.PackageName, in.PackageContent, in.PackageCostCents, catID, setCategory)
 }
 
 // ---- Movimientos -----------------------------------------------------------
@@ -208,6 +269,15 @@ func (svc *Service) ReplaceRecipe(ctx context.Context, tenantID, productID strin
 		seen[it.SupplyID] = true
 	}
 	return svc.store.replaceRecipe(ctx, tenantID, productID, items)
+}
+
+// normalizeID convierte cadenas vacías/espacios en nil (categoría opcional).
+func normalizeID(u *string) *string {
+	if u == nil || strings.TrimSpace(*u) == "" {
+		return nil
+	}
+	v := strings.TrimSpace(*u)
+	return &v
 }
 
 // normalizeReason recorta el motivo; cadena vacía => nil.

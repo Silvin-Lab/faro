@@ -16,17 +16,22 @@ import (
 func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
 
-	// Lectura: cualquier usuario del negocio con sesión.
+	// Lectura: cualquier usuario del negocio con sesión. Las rutas de segmento
+	// estático (/categories, /recipes) se registran ANTES/junto a /{id} para que chi
+	// las priorice sobre el path param: GET /supplies/categories NO cae en handleGet.
 	r.Group(func(r chi.Router) {
 		r.Use(requireSession)
 		r.Get("/", svc.handleList)
-		r.Get("/{id}", svc.handleGet)
+		r.Get("/categories", svc.handleListCategories)
 		r.Get("/recipes/{productId}", svc.handleGetRecipe)
+		r.Get("/{id}", svc.handleGet)
 	})
 	// Escritura: solo super admin.
 	r.Group(func(r chi.Router) {
 		r.Use(requireSuperAdmin)
 		r.Post("/", svc.handleCreate)
+		r.Post("/categories", svc.handleCreateCategory)
+		r.Patch("/categories/{id}", svc.handleUpdateCategory)
 		r.Patch("/{id}", svc.handleUpdate)
 		r.Post("/{id}/movements", svc.handleCreateMovement)
 		r.Get("/{id}/movements", svc.handleListMovements)
@@ -35,14 +40,93 @@ func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) 
 	return r
 }
 
+// ---- Categorías de insumo --------------------------------------------------
+
+type categoryRequest struct {
+	Name      string `json:"name"`
+	SortOrder int    `json:"sortOrder"`
+}
+
+func (svc *Service) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	var req categoryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
+		return
+	}
+	c, err := svc.CreateCategory(r.Context(), tenantID, req.Name, req.SortOrder)
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "El nombre es requerido")
+	case errors.Is(err, ErrNameTaken):
+		writeError(w, http.StatusConflict, "name_taken", "Ya existe una categoría con ese nombre")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo crear la categoría")
+	default:
+		writeJSON(w, http.StatusCreated, map[string]any{"category": c})
+	}
+}
+
+func (svc *Service) handleListCategories(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	items, err := svc.ListCategories(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar las categorías")
+		return
+	}
+	if items == nil {
+		items = []SupplyCategory{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+type categoryUpdateRequest struct {
+	Name      *string `json:"name"`
+	Status    *string `json:"status"`
+	SortOrder *int    `json:"sortOrder"`
+}
+
+func (svc *Service) handleUpdateCategory(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	var req categoryUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
+		return
+	}
+	c, err := svc.UpdateCategory(r.Context(), tenantID, chi.URLParam(r, "id"),
+		CategoryUpdate{Name: req.Name, Status: req.Status, SortOrder: req.SortOrder})
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "Datos inválidos")
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Categoría no encontrada")
+	case errors.Is(err, ErrNameTaken):
+		writeError(w, http.StatusConflict, "name_taken", "Ya existe una categoría con ese nombre")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo actualizar la categoría")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"category": c})
+	}
+}
+
 // ---- Catálogo --------------------------------------------------------------
 
 type createRequest struct {
-	Name             string `json:"name"`
-	BaseUnit         string `json:"baseUnit"`
-	PackageName      string `json:"packageName"`
-	PackageContent   int    `json:"packageContent"`
-	PackageCostCents *int   `json:"packageCostCents"` // opcional; null = costo no capturado
+	Name             string  `json:"name"`
+	BaseUnit         string  `json:"baseUnit"`
+	PackageName      string  `json:"packageName"`
+	PackageContent   int     `json:"packageContent"`
+	PackageCostCents *int    `json:"packageCostCents"` // opcional; null = costo no capturado
+	CategoryID       *string `json:"categoryId"`       // opcional; null/"" = sin categoría
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -55,10 +139,12 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
 		return
 	}
-	sp, err := svc.Create(r.Context(), tenantID, req.Name, req.BaseUnit, req.PackageName, req.PackageContent, req.PackageCostCents)
+	sp, err := svc.Create(r.Context(), tenantID, req.Name, req.BaseUnit, req.PackageName, req.PackageContent, req.PackageCostCents, req.CategoryID)
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Datos del insumo inválidos")
+	case errors.Is(err, ErrInvalidCategory):
+		writeError(w, http.StatusBadRequest, "invalid_category", "La categoría no es válida")
 	case errors.Is(err, ErrNameTaken):
 		writeError(w, http.StatusConflict, "name_taken", "Ya existe un insumo con ese nombre")
 	case err != nil:
@@ -107,6 +193,7 @@ type updateRequest struct {
 	PackageContent   *int    `json:"packageContent"`
 	PackageCostCents *int    `json:"packageCostCents"` // nil = no cambia
 	BaseUnit         *string `json:"baseUnit"`         // inmutable: si viene => validation_error
+	CategoryID       *string `json:"categoryId"`       // presente => asigna; ausente = no cambia
 }
 
 func (svc *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -122,11 +209,13 @@ func (svc *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	sp, err := svc.Update(r.Context(), tenantID, chi.URLParam(r, "id"), UpdateInput{
 		Name: req.Name, Status: req.Status, PackageName: req.PackageName,
 		PackageContent: req.PackageContent, PackageCostCents: req.PackageCostCents,
-		BaseUnit: req.BaseUnit,
+		BaseUnit: req.BaseUnit, CategoryID: req.CategoryID,
 	})
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Datos inválidos (la unidad base no se puede cambiar)")
+	case errors.Is(err, ErrInvalidCategory):
+		writeError(w, http.StatusBadRequest, "invalid_category", "La categoría no es válida")
 	case errors.Is(err, ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "Insumo no encontrado")
 	case errors.Is(err, ErrNameTaken):

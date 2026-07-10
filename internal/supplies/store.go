@@ -12,10 +12,11 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("not found")
-	ErrNameTaken     = errors.New("name taken")
-	ErrInvalidBranch = errors.New("invalid branch")
-	ErrInvalidSupply = errors.New("invalid supply")
+	ErrNotFound        = errors.New("not found")
+	ErrNameTaken       = errors.New("name taken")
+	ErrInvalidBranch   = errors.New("invalid branch")
+	ErrInvalidSupply   = errors.New("invalid supply")
+	ErrInvalidCategory = errors.New("invalid category")
 )
 
 type store struct {
@@ -31,16 +32,94 @@ func pgCode(err error, code string) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == code
 }
 
+// ---- Categorías de insumo (espejo de expense_categories) -------------------
+
+func (s *store) createCategory(ctx context.Context, tenantID, name string, sortOrder int) (SupplyCategory, error) {
+	var c SupplyCategory
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO supply_categories (tenant_id, name, sort_order)
+		 VALUES ($1, $2, $3)
+		 RETURNING id::text, tenant_id::text, name, status, sort_order, created_at`,
+		tenantID, name, sortOrder).
+		Scan(&c.ID, &c.TenantID, &c.Name, &c.Status, &c.SortOrder, &c.CreatedAt)
+	if pgCode(err, "23505") {
+		return SupplyCategory{}, ErrNameTaken
+	}
+	return c, err
+}
+
+func (s *store) listCategories(ctx context.Context, tenantID string) ([]SupplyCategory, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, tenant_id::text, name, status, sort_order, created_at
+		   FROM supply_categories WHERE tenant_id = $1 ORDER BY sort_order, name`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SupplyCategory
+	for rows.Next() {
+		var c SupplyCategory
+		if err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.Status, &c.SortOrder, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *store) updateCategory(ctx context.Context, tenantID, id string, name, status *string, sortOrder *int) (SupplyCategory, error) {
+	var c SupplyCategory
+	err := s.pool.QueryRow(ctx,
+		`UPDATE supply_categories
+		    SET name       = COALESCE($3, name),
+		        status     = COALESCE($4, status),
+		        sort_order = COALESCE($5, sort_order)
+		  WHERE id = $1 AND tenant_id = $2
+		  RETURNING id::text, tenant_id::text, name, status, sort_order, created_at`,
+		id, tenantID, name, status, sortOrder).
+		Scan(&c.ID, &c.TenantID, &c.Name, &c.Status, &c.SortOrder, &c.CreatedAt)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
+		return SupplyCategory{}, ErrNotFound
+	case pgCode(err, "23505"):
+		return SupplyCategory{}, ErrNameTaken
+	case err != nil:
+		return SupplyCategory{}, err
+	}
+	return c, nil
+}
+
+// categoryExists indica si la categoría pertenece al tenant. Un uuid mal formado
+// (22P02) se trata como inexistente.
+func (s *store) categoryExists(ctx context.Context, tenantID, id string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM supply_categories WHERE id = $1 AND tenant_id = $2)`,
+		id, tenantID).Scan(&ok)
+	if pgCode(err, "22P02") {
+		return false, nil
+	}
+	return ok, err
+}
+
 // ---- Insumos (catálogo) ----------------------------------------------------
 
-func (s *store) create(ctx context.Context, tenantID, name, baseUnit, packageName string, packageContent int, packageCostCents *int) (Supply, error) {
+func (s *store) create(ctx context.Context, tenantID, name, baseUnit, packageName string, packageContent int, packageCostCents *int, categoryID *string) (Supply, error) {
 	var sp Supply
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO supplies (tenant_id, name, base_unit, package_name, package_content, package_cost_cents)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING id::text, tenant_id::text, name, base_unit, package_name, package_content, package_cost_cents, status, created_at`,
-		tenantID, name, baseUnit, packageName, packageContent, packageCostCents).
-		Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent, &sp.PackageCostCents, &sp.Status, &sp.CreatedAt)
+		`WITH ins AS (
+		     INSERT INTO supplies (tenant_id, name, base_unit, package_name, package_content, package_cost_cents, category_id)
+		     VALUES ($1, $2, $3, $4, $5, $6, $7)
+		     RETURNING id, tenant_id, name, base_unit, package_name, package_content, package_cost_cents, category_id, status, created_at
+		 )
+		 SELECT i.id::text, i.tenant_id::text, i.name, i.base_unit, i.package_name, i.package_content,
+		        i.package_cost_cents, i.category_id::text, cat.name, i.status, i.created_at
+		   FROM ins i
+		   LEFT JOIN supply_categories cat ON cat.id = i.category_id`,
+		tenantID, name, baseUnit, packageName, packageContent, packageCostCents, categoryID).
+		Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent,
+			&sp.PackageCostCents, &sp.CategoryID, &sp.CategoryName, &sp.Status, &sp.CreatedAt)
 	if pgCode(err, "23505") {
 		return Supply{}, ErrNameTaken
 	}
@@ -52,9 +131,13 @@ func (s *store) create(ctx context.Context, tenantID, name, baseUnit, packageNam
 func (s *store) get(ctx context.Context, tenantID, id string) (Supply, error) {
 	var sp Supply
 	err := s.pool.QueryRow(ctx,
-		`SELECT id::text, tenant_id::text, name, base_unit, package_name, package_content, package_cost_cents, status, created_at
-		   FROM supplies WHERE id = $1 AND tenant_id = $2`, id, tenantID).
-		Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent, &sp.PackageCostCents, &sp.Status, &sp.CreatedAt)
+		`SELECT sp.id::text, sp.tenant_id::text, sp.name, sp.base_unit, sp.package_name, sp.package_content,
+		        sp.package_cost_cents, sp.category_id::text, cat.name, sp.status, sp.created_at
+		   FROM supplies sp
+		   LEFT JOIN supply_categories cat ON cat.id = sp.category_id
+		  WHERE sp.id = $1 AND sp.tenant_id = $2`, id, tenantID).
+		Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent,
+			&sp.PackageCostCents, &sp.CategoryID, &sp.CategoryName, &sp.Status, &sp.CreatedAt)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
 		return Supply{}, ErrNotFound
@@ -66,20 +149,31 @@ func (s *store) get(ctx context.Context, tenantID, id string) (Supply, error) {
 }
 
 // update aplica cambios parciales SOLO si el insumo es del tenant. base_unit NO se
-// toca aquí (inmutable; la capa service rechaza el intento).
-func (s *store) update(ctx context.Context, tenantID, id string, name, status, packageName *string, packageContent, packageCostCents *int) (Supply, error) {
+// toca aquí (inmutable; la capa service rechaza el intento). setCategory=true
+// reemplaza category_id por categoryID (ya validado como del tenant en service);
+// false lo deja intacto (el puntero nil = "no cambia" no se puede distinguir de
+// "poner a null" con un solo campo, así que PATCH solo asigna, no desasigna).
+func (s *store) update(ctx context.Context, tenantID, id string, name, status, packageName *string, packageContent, packageCostCents *int, categoryID *string, setCategory bool) (Supply, error) {
 	var sp Supply
 	err := s.pool.QueryRow(ctx,
-		`UPDATE supplies
-		    SET name               = COALESCE($3, name),
-		        status             = COALESCE($4, status),
-		        package_name       = COALESCE($5, package_name),
-		        package_content    = COALESCE($6, package_content),
-		        package_cost_cents = COALESCE($7, package_cost_cents)
-		  WHERE id = $1 AND tenant_id = $2
-		  RETURNING id::text, tenant_id::text, name, base_unit, package_name, package_content, package_cost_cents, status, created_at`,
-		id, tenantID, name, status, packageName, packageContent, packageCostCents).
-		Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent, &sp.PackageCostCents, &sp.Status, &sp.CreatedAt)
+		`WITH upd AS (
+		     UPDATE supplies
+		        SET name               = COALESCE($3, name),
+		            status             = COALESCE($4, status),
+		            package_name       = COALESCE($5, package_name),
+		            package_content    = COALESCE($6, package_content),
+		            package_cost_cents = COALESCE($7, package_cost_cents),
+		            category_id        = CASE WHEN $9 THEN $8 ELSE category_id END
+		      WHERE id = $1 AND tenant_id = $2
+		      RETURNING id, tenant_id, name, base_unit, package_name, package_content, package_cost_cents, category_id, status, created_at
+		 )
+		 SELECT u.id::text, u.tenant_id::text, u.name, u.base_unit, u.package_name, u.package_content,
+		        u.package_cost_cents, u.category_id::text, cat.name, u.status, u.created_at
+		   FROM upd u
+		   LEFT JOIN supply_categories cat ON cat.id = u.category_id`,
+		id, tenantID, name, status, packageName, packageContent, packageCostCents, categoryID, setCategory).
+		Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent,
+			&sp.PackageCostCents, &sp.CategoryID, &sp.CategoryName, &sp.Status, &sp.CreatedAt)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
 		return Supply{}, ErrNotFound
@@ -98,8 +192,11 @@ func (s *store) update(ctx context.Context, tenantID, id string, name, status, p
 // una sucursal ausente = 0 (lo interpreta la UI). Ver decisión en model.go.
 func (s *store) list(ctx context.Context, tenantID string) ([]Supply, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id::text, tenant_id::text, name, base_unit, package_name, package_content, package_cost_cents, status, created_at
-		   FROM supplies WHERE tenant_id = $1 ORDER BY name`, tenantID)
+		`SELECT sp.id::text, sp.tenant_id::text, sp.name, sp.base_unit, sp.package_name, sp.package_content,
+		        sp.package_cost_cents, sp.category_id::text, cat.name, sp.status, sp.created_at
+		   FROM supplies sp
+		   LEFT JOIN supply_categories cat ON cat.id = sp.category_id
+		  WHERE sp.tenant_id = $1 ORDER BY sp.name`, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +206,8 @@ func (s *store) list(ctx context.Context, tenantID string) ([]Supply, error) {
 	idx := map[string]int{}
 	for rows.Next() {
 		var sp Supply
-		if err := rows.Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent, &sp.PackageCostCents, &sp.Status, &sp.CreatedAt); err != nil {
+		if err := rows.Scan(&sp.ID, &sp.TenantID, &sp.Name, &sp.BaseUnit, &sp.PackageName, &sp.PackageContent,
+			&sp.PackageCostCents, &sp.CategoryID, &sp.CategoryName, &sp.Status, &sp.CreatedAt); err != nil {
 			return nil, err
 		}
 		sp.Stock = []BranchStock{}
