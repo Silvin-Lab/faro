@@ -43,3 +43,33 @@ type SalesReport struct {
 	ByHour          []HourBreakdown     `json:"byHour"`
 	ByBranch        []BranchBreakdown   `json:"byBranch"`
 }
+
+// ---- Reporte de gastos -----------------------------------------------------
+
+// ExpensesSummary es el resumen del reporte de gastos.
+type ExpensesSummary struct {
+	ExpensesCount int `json:"expensesCount"`
+	TotalCents    int `json:"totalCents"`
+}
+
+// ExpenseCategoryBreakdown agrega gastos por categoría de gasto. El bucket sin
+// categoría (concepto sin categoría o borrado) se etiqueta "Sin categoría".
+type ExpenseCategoryBreakdown struct {
+	CategoryName string `json:"categoryName"`
+	Count        int    `json:"count"`
+	TotalCents   int    `json:"totalCents"`
+}
+
+// ExpenseBranchBreakdown agrega gastos por sucursal.
+type ExpenseBranchBreakdown struct {
+	BranchID   *string `json:"branchId"`
+	BranchName string  `json:"branchName"`
+	Count      int     `json:"count"`
+	TotalCents int     `json:"totalCents"`
+}
+
+type ExpensesReport struct {
+	Summary    ExpensesSummary            `json:"summary"`
+	ByCategory []ExpenseCategoryBreakdown `json:"byCategory"`
+	ByBranch   []ExpenseBranchBreakdown   `json:"byBranch"`
+}

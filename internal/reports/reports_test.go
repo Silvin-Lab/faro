@@ -24,7 +24,7 @@ func testSvc(t *testing.T) (*Service, *pgxpool.Pool, string, string) {
 		pool.Close()
 		t.Skipf("DB de test no disponible: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE sale_items, sales, products, categories, customers, users, tenants RESTART IDENTITY CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE expenses, expense_concepts, expense_categories, sale_items, sales, products, categories, customers, users, branches, tenants RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -89,5 +89,87 @@ func TestSalesReport(t *testing.T) {
 	}
 	if repB.TotalCents != 9999 || repB.SalesCount != 1 || len(repB.ByCategory) != 0 {
 		t.Fatalf("aislamiento B: total=%d count=%d categorías=%d", repB.TotalCents, repB.SalesCount, len(repB.ByCategory))
+	}
+}
+
+// TestExpensesReport cubre totales, bucket "Sin categoría", desglose por sucursal,
+// filtro BranchFilter y aislamiento de tenant.
+func TestExpensesReport(t *testing.T) {
+	svc, pool, a, b := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	var bA1, bA2, bB1, userA, userB, catServ, conLuz, conVarios, conB string
+	q := func(dst *string, sql string, args ...any) {
+		if err := pool.QueryRow(ctx, sql, args...).Scan(dst); err != nil {
+			t.Fatalf("seed (%s): %v", sql, err)
+		}
+	}
+	q(&bA1, "INSERT INTO branches (tenant_id,name) VALUES ($1,'A-Centro') RETURNING id::text", a)
+	q(&bA2, "INSERT INTO branches (tenant_id,name) VALUES ($1,'A-Norte') RETURNING id::text", a)
+	q(&bB1, "INSERT INTO branches (tenant_id,name) VALUES ($1,'B-Centro') RETURNING id::text", b)
+	q(&userA, "INSERT INTO users (tenant_id,email,password_hash,name,role) VALUES ($1,'ra@t.test','x','Ana','cashier') RETURNING id::text", a)
+	q(&userB, "INSERT INTO users (tenant_id,email,password_hash,name,role) VALUES ($1,'rb@t.test','x','Beto','cashier') RETURNING id::text", b)
+	q(&catServ, "INSERT INTO expense_categories (tenant_id,name) VALUES ($1,'Servicios') RETURNING id::text", a)
+	q(&conLuz, "INSERT INTO expense_concepts (tenant_id,category_id,name) VALUES ($1,$2,'Luz') RETURNING id::text", a, catServ)
+	q(&conVarios, "INSERT INTO expense_concepts (tenant_id,name) VALUES ($1,'Varios') RETURNING id::text", a) // sin categoría
+	q(&conB, "INSERT INTO expense_concepts (tenant_id,name) VALUES ($1,'AguaB') RETURNING id::text", b)
+
+	ins := func(tenant, branch, concept, cname string, amount int, by string) {
+		if _, err := pool.Exec(ctx,
+			"INSERT INTO expenses (tenant_id,branch_id,concept_id,concept_name,amount_cents,created_by) VALUES ($1,$2,$3,$4,$5,$6)",
+			tenant, branch, concept, cname, amount, by); err != nil {
+			t.Fatalf("seed gasto: %v", err)
+		}
+	}
+	// Tenant A: Servicios/Luz 100 (A1) + 200 (A2); Sin categoría/Varios 50 (A1).
+	ins(a, bA1, conLuz, "Luz", 100, userA)
+	ins(a, bA2, conLuz, "Luz", 200, userA)
+	ins(a, bA1, conVarios, "Varios", 50, userA)
+	// Tenant B: 999 (aislamiento).
+	ins(b, bB1, conB, "AguaB", 999, userB)
+
+	from := time.Now().Add(-time.Hour)
+	to := time.Now().Add(time.Hour)
+
+	// Sin filtro de sucursal: totales del tenant A.
+	rep, err := svc.ExpensesReport(ctx, a, from, to, BranchFilter{})
+	if err != nil {
+		t.Fatalf("reporte gastos: %v", err)
+	}
+	if rep.Summary.ExpensesCount != 3 || rep.Summary.TotalCents != 350 {
+		t.Fatalf("resumen: esperaba count=3 total=350, obtuvo %+v", rep.Summary)
+	}
+
+	// Por categoría: "Servicios" (300) y "Sin categoría" (50).
+	byCat := map[string]int{}
+	for _, c := range rep.ByCategory {
+		byCat[c.CategoryName] = c.TotalCents
+	}
+	if byCat["Servicios"] != 300 || byCat["Sin categoría"] != 50 {
+		t.Fatalf("por categoría inesperado: %+v", rep.ByCategory)
+	}
+
+	// Por sucursal: A1 (150) y A2 (200).
+	byBr := map[string]int{}
+	for _, br := range rep.ByBranch {
+		if br.BranchID != nil {
+			byBr[*br.BranchID] = br.TotalCents
+		}
+	}
+	if byBr[bA1] != 150 || byBr[bA2] != 200 {
+		t.Fatalf("por sucursal inesperado: %+v", rep.ByBranch)
+	}
+
+	// BranchFilter a A1: solo 150 (2 gastos).
+	repA1, _ := svc.ExpensesReport(ctx, a, from, to, BranchFilter{ID: &bA1})
+	if repA1.Summary.ExpensesCount != 2 || repA1.Summary.TotalCents != 150 {
+		t.Fatalf("filtro A1: esperaba count=2 total=150, obtuvo %+v", repA1.Summary)
+	}
+
+	// Aislamiento: tenant B solo ve su gasto.
+	repB, _ := svc.ExpensesReport(ctx, b, from, to, BranchFilter{})
+	if repB.Summary.ExpensesCount != 1 || repB.Summary.TotalCents != 999 {
+		t.Fatalf("aislamiento B: %+v", repB.Summary)
 	}
 }

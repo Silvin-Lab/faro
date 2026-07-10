@@ -202,6 +202,14 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 		sale.Items = append(sale.Items, item)
 	}
 
+	// Descuento automático de insumos: en la misma transacción de la venta se
+	// descuenta del inventario lo que consume cada producto según su receta. No
+	// bloquea (productos sin receta = no-op; el stock puede quedar negativo) pero
+	// tampoco se traga errores: un fallo aquí revierte la venta completa.
+	if err := deductSupplies(ctx, tx, tenantID, sale.ID, sale.BranchID, lines); err != nil {
+		return Sale{}, err
+	}
+
 	// Lealtad: cada venta con cliente incrementa el contador de ciclo y el de por
 	// vida. Si se aplicó una promoción con descuento, se escribe el snapshot y —si
 	// la promoción reinicia— el contador de ciclo vuelve a 0.
@@ -239,6 +247,57 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 		return Sale{}, err
 	}
 	return sale, nil
+}
+
+// deductSupplies descuenta del inventario los insumos consumidos por la venta,
+// según la receta global de cada producto (product_supplies), dentro de la MISMA
+// transacción de la venta. Por cada insumo consumido escribe un movimiento 'sale'
+// con cantidad NEGATIVA (created_by y reason en NULL) y actualiza el cache de
+// existencias de la sucursal de la venta. Es set-based y no bloqueante: un
+// producto sin receta no produce filas (no-op natural) y el stock puede quedar
+// negativo (no hay CHECK). Si branchID es nil se omite (defensivo; el handler ya
+// exige sucursal). NO se tragan errores: si el SQL falla, la venta falla completa.
+func deductSupplies(ctx context.Context, tx pgx.Tx, tenantID, saleID string, branchID *string, lines []computedLine) error {
+	if branchID == nil {
+		return nil
+	}
+	productIDs := make([]string, len(lines))
+	qtys := make([]int, len(lines))
+	for i, l := range lines {
+		productIDs[i] = l.productID
+		qtys[i] = l.quantity
+	}
+	// unnest en paralelo de (product_id, qty) -> agrega por insumo (mismo producto
+	// en varias líneas suma) -> movimientos 'sale' -> upsert del cache restando.
+	// ORDER BY supply_id en el upsert da un orden de bloqueo determinista
+	// (anti-deadlock) entre ventas concurrentes de la misma sucursal.
+	_, err := tx.Exec(ctx,
+		`WITH lineas AS (
+		     SELECT product_id, qty
+		       FROM unnest($4::uuid[], $5::int[]) AS u(product_id, qty)
+		 ),
+		 consumo AS (
+		     SELECT ps.supply_id, SUM(ps.quantity_base * l.qty)::int AS total
+		       FROM lineas l
+		       JOIN product_supplies ps
+		         ON ps.product_id = l.product_id AND ps.tenant_id = $1
+		   GROUP BY ps.supply_id
+		 ),
+		 mov AS (
+		     INSERT INTO supply_movements (tenant_id, supply_id, branch_id, type, quantity_base, sale_id)
+		     SELECT $1, supply_id, $3, 'sale', -total, $2
+		       FROM consumo
+		     RETURNING supply_id, quantity_base
+		 )
+		 INSERT INTO supply_branch_stock (tenant_id, supply_id, branch_id, stock_base)
+		 SELECT $1, supply_id, $3, quantity_base
+		   FROM mov
+		  ORDER BY supply_id
+		 ON CONFLICT (supply_id, branch_id) DO UPDATE
+		    SET stock_base = supply_branch_stock.stock_base + EXCLUDED.stock_base,
+		        updated_at = now()`,
+		tenantID, saleID, *branchID, productIDs, qtys)
+	return err
 }
 
 // loadPromotion carga una promoción activa del negocio con su set de productos.

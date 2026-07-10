@@ -156,3 +156,80 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 	brRows.Close()
 	return rep, brRows.Err()
 }
+
+// expensesReport agrega los gastos del negocio en [from, to). branch acota
+// opcionalmente a una sucursal. Reutiliza branchClause (mismo contrato que ventas).
+func (s *store) expensesReport(ctx context.Context, tenantID string, from, to time.Time, branch BranchFilter) (ExpensesReport, error) {
+	rep := ExpensesReport{
+		ByCategory: []ExpenseCategoryBreakdown{},
+		ByBranch:   []ExpenseBranchBreakdown{},
+	}
+
+	// Resumen.
+	sumCond, sumArgs := branchClause("e.", 4, branch)
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(e.amount_cents), 0)
+		   FROM expenses e
+		  WHERE e.tenant_id = $1 AND e.created_at >= $2 AND e.created_at < $3`+sumCond,
+		append([]any{tenantID, from, to}, sumArgs...)...).
+		Scan(&rep.Summary.ExpensesCount, &rep.Summary.TotalCents); err != nil {
+		return ExpensesReport{}, err
+	}
+
+	// Por categoría de gasto (gasto -> concepto -> categoría). Bucket "Sin categoría".
+	catCond, catArgs := branchClause("e.", 4, branch)
+	catRows, err := s.pool.Query(ctx,
+		`SELECT COALESCE(cat.name, 'Sin categoría'), COUNT(*), COALESCE(SUM(e.amount_cents), 0)
+		   FROM expenses e
+		   LEFT JOIN expense_concepts ec ON ec.id = e.concept_id
+		   LEFT JOIN expense_categories cat ON cat.id = ec.category_id
+		  WHERE e.tenant_id = $1 AND e.created_at >= $2 AND e.created_at < $3`+catCond+`
+		  GROUP BY COALESCE(cat.name, 'Sin categoría')
+		  ORDER BY SUM(e.amount_cents) DESC`,
+		append([]any{tenantID, from, to}, catArgs...)...)
+	if err != nil {
+		return ExpensesReport{}, err
+	}
+	for catRows.Next() {
+		var b ExpenseCategoryBreakdown
+		if err := catRows.Scan(&b.CategoryName, &b.Count, &b.TotalCents); err != nil {
+			catRows.Close()
+			return ExpensesReport{}, err
+		}
+		rep.ByCategory = append(rep.ByCategory, b)
+	}
+	catRows.Close()
+	if err := catRows.Err(); err != nil {
+		return ExpensesReport{}, err
+	}
+
+	// Por sucursal (expenses.branch_id es NOT NULL; LEFT JOIN por robustez).
+	brCond, brArgs := branchClause("e.", 4, branch)
+	brRows, err := s.pool.Query(ctx,
+		`SELECT e.branch_id::text, b.name, COUNT(*), COALESCE(SUM(e.amount_cents), 0)
+		   FROM expenses e
+		   LEFT JOIN branches b ON b.id = e.branch_id
+		  WHERE e.tenant_id = $1 AND e.created_at >= $2 AND e.created_at < $3`+brCond+`
+		  GROUP BY e.branch_id, b.name
+		  ORDER BY SUM(e.amount_cents) DESC`,
+		append([]any{tenantID, from, to}, brArgs...)...)
+	if err != nil {
+		return ExpensesReport{}, err
+	}
+	for brRows.Next() {
+		var b ExpenseBranchBreakdown
+		var name *string
+		if err := brRows.Scan(&b.BranchID, &name, &b.Count, &b.TotalCents); err != nil {
+			brRows.Close()
+			return ExpensesReport{}, err
+		}
+		if b.BranchID == nil || name == nil {
+			b.BranchName = "Sin sucursal"
+		} else {
+			b.BranchName = *name
+		}
+		rep.ByBranch = append(rep.ByBranch, b)
+	}
+	brRows.Close()
+	return rep, brRows.Err()
+}
