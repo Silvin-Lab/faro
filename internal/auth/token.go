@@ -17,10 +17,13 @@ type Claims struct {
 type tokenManager struct {
 	secret []byte
 	ttl    time.Duration
+	// now es el reloj inyectable. En producción es time.Now; los tests lo
+	// sustituyen para fijar la hora y verificar el cálculo de expiración.
+	now func() time.Time
 }
 
 func newTokenManager(secret string, ttl time.Duration) *tokenManager {
-	return &tokenManager{secret: []byte(secret), ttl: ttl}
+	return &tokenManager{secret: []byte(secret), ttl: ttl, now: time.Now}
 }
 
 type jwtClaims struct {
@@ -30,17 +33,25 @@ type jwtClaims struct {
 	jwt.RegisteredClaims
 }
 
-// issue emite un token con el TTL base del manager (default). Para un TTL por rol
-// usar issueFor.
+// issue emite un token con el TTL base del manager (default). Se usa en pruebas y
+// flujos que no son sesión de usuario. Para una sesión de login usar issueSession.
 func (tm *tokenManager) issue(c Claims) (string, time.Time, error) {
-	return tm.issueFor(c, tm.ttl)
+	return tm.issueUntil(c, tm.now().Add(tm.ttl))
 }
 
-// issueFor emite un token cuya expiración es now+ttl, permitiendo una duración de
-// sesión por rol (ver sessionTTLFor). La cookie debe usar el mismo exp devuelto.
-func (tm *tokenManager) issueFor(c Claims, ttl time.Duration) (string, time.Time, error) {
-	now := time.Now()
-	exp := now.Add(ttl)
+// issueSession emite un token de sesión de usuario cuya expiración es la próxima
+// 8:00 am hora de México (con guardia de vida mínima; ver nextSessionExpiry). La
+// regla es única para todos los roles (staff y admins) para ser predecible. La
+// cookie debe usar el mismo exp devuelto para que cookie y JWT exp coincidan.
+func (tm *tokenManager) issueSession(c Claims) (string, time.Time, error) {
+	return tm.issueUntil(c, nextSessionExpiry(tm.now()))
+}
+
+// issueUntil emite un token firmado que expira exactamente en exp. iat = tm.now().
+// Solo cambia el cálculo del exp respecto al flujo anterior: claims y firma son
+// idénticos.
+func (tm *tokenManager) issueUntil(c Claims, exp time.Time) (string, time.Time, error) {
+	now := tm.now()
 
 	tid := ""
 	if c.TenantID != nil {
