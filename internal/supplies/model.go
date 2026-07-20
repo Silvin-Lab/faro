@@ -37,18 +37,30 @@ type SupplyCategory struct {
 // CategoryID/CategoryName son OPCIONALES (nil / JSON null = "Sin categoría"). Se
 // derivan por LEFT JOIN a supply_categories en list/get/create/update.
 type Supply struct {
-	ID               string        `json:"id"`
-	TenantID         string        `json:"tenantId"`
-	Name             string        `json:"name"`
-	BaseUnit         string        `json:"baseUnit"` // g | ml | pieza
-	PackageName      string        `json:"packageName"`
-	PackageContent   int           `json:"packageContent"`
-	PackageCostCents *int          `json:"packageCostCents"` // centavos; null = desconocido
-	CategoryID       *string       `json:"categoryId"`       // null = sin categoría
-	CategoryName     *string       `json:"categoryName"`     // null = sin categoría
-	Status           string        `json:"status"`
-	CreatedAt        time.Time     `json:"createdAt"`
-	Stock            []BranchStock `json:"stock"`
+	ID               string          `json:"id"`
+	TenantID         string          `json:"tenantId"`
+	Name             string          `json:"name"`
+	BaseUnit         string          `json:"baseUnit"` // g | ml | pieza
+	PackageName      string          `json:"packageName"`
+	PackageContent   int             `json:"packageContent"`
+	PackageCostCents *int            `json:"packageCostCents"` // centavos; null = desconocido
+	CategoryID       *string         `json:"categoryId"`       // null = sin categoría
+	CategoryName     *string         `json:"categoryName"`     // null = sin categoría
+	Status           string          `json:"status"`
+	CreatedAt        time.Time       `json:"createdAt"`
+	Stock            []BranchStock   `json:"stock"`
+	Measures         []SupplyMeasure `json:"measures"`
+}
+
+// SupplyMeasure es una "medida de uso" de un insumo (ej. scoop = 25 g). BaseQuantity
+// = equivalente de UNA medida en la unidad base del insumo. Un insumo puede tener
+// varias medidas; la receta elige cuál por línea. El contrato promete siempre un
+// array en Supply.Measures, nunca null/ausente.
+type SupplyMeasure struct {
+	ID           string `json:"id"`
+	SupplyID     string `json:"supplyId"`
+	Name         string `json:"name"`
+	BaseQuantity int    `json:"baseQuantity"` // en unidad base del insumo
 }
 
 // BranchStock son las existencias de un insumo en una sucursal (cache). stockBase
@@ -79,10 +91,19 @@ type Movement struct {
 }
 
 // RecipeItem es una línea de receta (insumo + cantidad por unidad vendida). La
-// receta es global (no depende de sucursal).
+// receta es global (no depende de sucursal). QuantityBase (unidad base) es SIEMPRE
+// la fuente de verdad del consumo/descuento. Los campos de medida son opcionales
+// (LEFT JOIN a supply_measures):
+//   - Línea en unidad base: MeasureID/MeasureName/MeasureCount = nil.
+//   - Línea por medida: MeasureID/MeasureName/MeasureCount set; QuantityBase =
+//     ROUND(MeasureCount * baseQuantity) computado al guardar. Si la medida se borró,
+//     MeasureID queda nil (SET NULL) y QuantityBase se conserva "congelado".
 type RecipeItem struct {
-	SupplyID     string `json:"supplyId"`
-	SupplyName   string `json:"supplyName"`
-	BaseUnit     string `json:"baseUnit"`
-	QuantityBase int    `json:"quantityBase"`
+	SupplyID     string   `json:"supplyId"`
+	SupplyName   string   `json:"supplyName"`
+	BaseUnit     string   `json:"baseUnit"`
+	QuantityBase int      `json:"quantityBase"`
+	MeasureID    *string  `json:"measureId"`    // null = capturado en unidad base
+	MeasureName  *string  `json:"measureName"`  // null = sin medida
+	MeasureCount *float64 `json:"measureCount"` // null = sin medida
 }

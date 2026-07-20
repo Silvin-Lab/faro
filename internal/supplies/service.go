@@ -3,6 +3,7 @@ package supplies
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"time"
 
@@ -241,6 +242,62 @@ func (svc *Service) ListMovements(ctx context.Context, tenantID, supplyID string
 	return svc.store.listMovements(ctx, tenantID, supplyID, from, to)
 }
 
+// ---- Medidas de uso --------------------------------------------------------
+
+// ListMeasures devuelve las medidas de un insumo del tenant (404 si el insumo es
+// ajeno/inexistente).
+func (svc *Service) ListMeasures(ctx context.Context, tenantID, supplyID string) ([]SupplyMeasure, error) {
+	if _, err := svc.store.get(ctx, tenantID, supplyID); err != nil {
+		return nil, err // ErrNotFound o error real
+	}
+	return svc.store.listMeasures(ctx, tenantID, supplyID)
+}
+
+// CreateMeasure crea una medida para un insumo del tenant. Nombre requerido y
+// baseQuantity > 0 (ErrValidation); insumo ajeno/inexistente => ErrNotFound; nombre
+// duplicado por insumo => ErrNameTaken.
+func (svc *Service) CreateMeasure(ctx context.Context, tenantID, supplyID, name string, baseQuantity int) (SupplyMeasure, error) {
+	if _, err := svc.store.get(ctx, tenantID, supplyID); err != nil {
+		return SupplyMeasure{}, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || baseQuantity <= 0 {
+		return SupplyMeasure{}, ErrValidation
+	}
+	return svc.store.createMeasure(ctx, tenantID, supplyID, name, baseQuantity)
+}
+
+// MeasureUpdate agrupa los cambios parciales de una medida (nil = no cambia).
+type MeasureUpdate struct {
+	Name         *string
+	BaseQuantity *int
+}
+
+// UpdateMeasure aplica cambios parciales a una medida del tenant. Si baseQuantity
+// cambia, el store recomputa el quantity_base de las recetas que la usan en la misma
+// transacción (recálculo en vivo). name vacío / baseQuantity <= 0 => ErrValidation;
+// medida ajena/inexistente => ErrNotFound; nombre duplicado => ErrNameTaken.
+func (svc *Service) UpdateMeasure(ctx context.Context, tenantID, measureID string, in MeasureUpdate) (SupplyMeasure, error) {
+	if in.Name != nil {
+		n := strings.TrimSpace(*in.Name)
+		if n == "" {
+			return SupplyMeasure{}, ErrValidation
+		}
+		in.Name = &n
+	}
+	if in.BaseQuantity != nil && *in.BaseQuantity <= 0 {
+		return SupplyMeasure{}, ErrValidation
+	}
+	return svc.store.updateMeasure(ctx, tenantID, measureID, in.Name, in.BaseQuantity)
+}
+
+// DeleteMeasure borra una medida del tenant. Las recetas que la usaban conservan su
+// quantity_base "congelado" (ON DELETE SET NULL). Medida ajena/inexistente =>
+// ErrNotFound.
+func (svc *Service) DeleteMeasure(ctx context.Context, tenantID, measureID string) error {
+	return svc.store.deleteMeasure(ctx, tenantID, measureID)
+}
+
 // ---- Recetas ---------------------------------------------------------------
 
 func (svc *Service) GetRecipe(ctx context.Context, tenantID, productID string) ([]RecipeItem, error) {
@@ -259,14 +316,45 @@ func (svc *Service) ReplaceRecipe(ctx context.Context, tenantID, productID strin
 		return nil, ErrNotFound
 	}
 	seen := map[string]bool{}
-	for _, it := range items {
-		if strings.TrimSpace(it.SupplyID) == "" || it.QuantityBase <= 0 {
+	for i := range items {
+		it := &items[i]
+		if strings.TrimSpace(it.SupplyID) == "" {
 			return nil, ErrValidation
 		}
 		if seen[it.SupplyID] {
 			return nil, ErrValidation // insumo repetido en la misma receta
 		}
 		seen[it.SupplyID] = true
+
+		measureID := normalizeID(it.MeasureID)
+		if measureID != nil {
+			// Línea por medida: la medida debe pertenecer a ESE insumo y al tenant.
+			// quantity_base = ROUND(count * base); si redondea a < 1 viola el CHECK y
+			// no tiene sentido físico -> validation_error.
+			if it.MeasureCount == nil || *it.MeasureCount <= 0 {
+				return nil, ErrValidation
+			}
+			base, ok, err := svc.store.measureForSupply(ctx, tenantID, it.SupplyID, *measureID)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, ErrInvalidMeasure
+			}
+			qb := int(math.Round(*it.MeasureCount * float64(base)))
+			if qb < 1 {
+				return nil, ErrValidation
+			}
+			it.MeasureID = measureID
+			it.QuantityBase = qb
+		} else {
+			// Línea en unidad base: quantity_base directo (comportamiento actual).
+			it.MeasureID = nil
+			it.MeasureCount = nil
+			if it.QuantityBase <= 0 {
+				return nil, ErrValidation
+			}
+		}
 	}
 	return svc.store.replaceRecipe(ctx, tenantID, productID, items)
 }

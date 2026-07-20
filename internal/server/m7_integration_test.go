@@ -355,3 +355,79 @@ func TestM7V2Flow(t *testing.T) {
 		t.Fatalf("DELETE /branches en uso: esperaba 409, obtuvo %d", resp.StatusCode)
 	}
 }
+
+// TestSupplyMeasuresAuthz verifica la autorización de las medidas de uso: la escritura
+// (POST/PATCH/DELETE) es solo super admin (cajero => 403, el middleware corta antes del
+// handler), mientras que la lectura (GET) está permitida a cualquier sesión (cajero =>
+// 404 con id inexistente, NO 403). El super admin sí escribe (201).
+func TestSupplyMeasuresAuthz(t *testing.T) {
+	env := setupM7(t)
+	defer env.close()
+
+	root := newClient(t)
+	env.login(t, root, "root@faro.test", "secret123")
+	b1 := env.createBranch(t, root, "Centro")
+
+	// Alta del cajero con una sucursal.
+	if resp := env.do(t, root, http.MethodPost, "/users", map[string]any{
+		"email": "cajero2@vanta.test", "password": "secret123", "name": "Cajero", "role": "cashier", "branchIds": []string{b1},
+	}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /users cajero: esperaba 201, obtuvo %d", resp.StatusCode)
+	}
+
+	// Super admin crea un insumo real (para probar el POST 201 y el GET 200).
+	resp := env.do(t, root, http.MethodPost, "/supplies", map[string]any{
+		"name": "Chocolate", "baseUnit": "g", "packageName": "Bolsa 1kg", "packageContent": 1000,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /supplies: esperaba 201, obtuvo %d", resp.StatusCode)
+	}
+	var sc struct {
+		Supply supplies.Supply `json:"supply"`
+	}
+	decode(t, resp, &sc)
+	supplyID := sc.Supply.ID
+
+	// Super admin SÍ crea una medida (201) -> tenemos un measureId real.
+	resp = env.do(t, root, http.MethodPost, "/supplies/"+supplyID+"/measures", map[string]any{"name": "scoop", "baseQuantity": 25})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("super admin POST measures: esperaba 201, obtuvo %d", resp.StatusCode)
+	}
+	var mc struct {
+		Measure supplies.SupplyMeasure `json:"measure"`
+	}
+	decode(t, resp, &mc)
+	measureID := mc.Measure.ID
+
+	// --- Cajero: escritura de medidas => 403 (middleware antes del handler) ----
+	cajero := newClient(t)
+	env.login(t, cajero, "cajero2@vanta.test", "secret123")
+	env.do(t, cajero, http.MethodPost, "/auth/select-branch", map[string]string{"branchId": b1}).Body.Close()
+
+	if resp := env.do(t, cajero, http.MethodPost, "/supplies/"+supplyID+"/measures", map[string]any{"name": "cucharada", "baseQuantity": 12}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cajero POST measures: esperaba 403, obtuvo %d", resp.StatusCode)
+	}
+	if resp := env.do(t, cajero, http.MethodPatch, "/supplies/measures/"+measureID, map[string]any{"baseQuantity": 30}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cajero PATCH measures: esperaba 403, obtuvo %d", resp.StatusCode)
+	}
+	if resp := env.do(t, cajero, http.MethodDelete, "/supplies/measures/"+measureID, nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cajero DELETE measures: esperaba 403, obtuvo %d", resp.StatusCode)
+	}
+
+	// --- Cajero: lectura SÍ permitida (200 con insumo real) -------------------
+	resp = env.do(t, cajero, http.MethodGet, "/supplies/"+supplyID+"/measures", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cajero GET measures: esperaba 200, obtuvo %d", resp.StatusCode)
+	}
+	var lm struct {
+		Items []supplies.SupplyMeasure `json:"items"`
+	}
+	decode(t, resp, &lm)
+	if len(lm.Items) != 1 || lm.Items[0].Name != "scoop" {
+		t.Fatalf("cajero GET measures: esperaba [scoop], obtuvo %+v", lm.Items)
+	}
+	// La medida del super admin sigue intacta (el cajero no pudo mutarla).
+	if lm.Items[0].BaseQuantity != 25 {
+		t.Fatalf("medida esperaba baseQuantity 25 (cajero no debió mutarla), obtuvo %d", lm.Items[0].BaseQuantity)
+	}
+}

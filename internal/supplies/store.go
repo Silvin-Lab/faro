@@ -17,6 +17,7 @@ var (
 	ErrInvalidBranch   = errors.New("invalid branch")
 	ErrInvalidSupply   = errors.New("invalid supply")
 	ErrInvalidCategory = errors.New("invalid category")
+	ErrInvalidMeasure  = errors.New("invalid measure")
 )
 
 type store struct {
@@ -124,10 +125,12 @@ func (s *store) create(ctx context.Context, tenantID, name, baseUnit, packageNam
 		return Supply{}, ErrNameTaken
 	}
 	sp.Stock = []BranchStock{}
+	sp.Measures = []SupplyMeasure{}
 	return sp, err
 }
 
-// get devuelve un insumo del tenant (sin existencias). uuid mal formado => not found.
+// get devuelve un insumo del tenant (sin existencias) con sus medidas de uso. uuid
+// mal formado => not found.
 func (s *store) get(ctx context.Context, tenantID, id string) (Supply, error) {
 	var sp Supply
 	err := s.pool.QueryRow(ctx,
@@ -145,6 +148,11 @@ func (s *store) get(ctx context.Context, tenantID, id string) (Supply, error) {
 		return Supply{}, err
 	}
 	sp.Stock = []BranchStock{}
+	measures, err := s.listMeasures(ctx, tenantID, sp.ID)
+	if err != nil {
+		return Supply{}, err
+	}
+	sp.Measures = measures
 	return sp, nil
 }
 
@@ -183,6 +191,11 @@ func (s *store) update(ctx context.Context, tenantID, id string, name, status, p
 		return Supply{}, err
 	}
 	sp.Stock = []BranchStock{}
+	measures, err := s.listMeasures(ctx, tenantID, sp.ID)
+	if err != nil {
+		return Supply{}, err
+	}
+	sp.Measures = measures
 	return sp, nil
 }
 
@@ -211,6 +224,7 @@ func (s *store) list(ctx context.Context, tenantID string) ([]Supply, error) {
 			return nil, err
 		}
 		sp.Stock = []BranchStock{}
+		sp.Measures = []SupplyMeasure{}
 		idx[sp.ID] = len(out)
 		out = append(out, sp)
 	}
@@ -238,7 +252,31 @@ func (s *store) list(ctx context.Context, tenantID string) ([]Supply, error) {
 			out[i].Stock = append(out[i].Stock, bs)
 		}
 	}
-	return out, stockRows.Err()
+	if err := stockRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Medidas de uso: 2ª query agrupada (evita N+1, como el stock). Solo aparecen
+	// las medidas de insumos del tenant; se agrupan en memoria por supply_id.
+	measureRows, err := s.pool.Query(ctx,
+		`SELECT id::text, supply_id::text, name, base_quantity
+		   FROM supply_measures
+		  WHERE tenant_id = $1
+		  ORDER BY name`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer measureRows.Close()
+	for measureRows.Next() {
+		var m SupplyMeasure
+		if err := measureRows.Scan(&m.ID, &m.SupplyID, &m.Name, &m.BaseQuantity); err != nil {
+			return nil, err
+		}
+		if i, ok := idx[m.SupplyID]; ok {
+			out[i].Measures = append(out[i].Measures, m)
+		}
+	}
+	return out, measureRows.Err()
 }
 
 // branchInTenant indica si la sucursal pertenece al tenant. uuid mal formado => false.
@@ -345,6 +383,148 @@ func (s *store) listMovements(ctx context.Context, tenantID, supplyID string, fr
 	return out, rows.Err()
 }
 
+// ---- Medidas de uso --------------------------------------------------------
+
+// listMeasures devuelve las medidas de un insumo del tenant, ordenadas por nombre.
+// uuid mal formado => lista vacía (sin error).
+func (s *store) listMeasures(ctx context.Context, tenantID, supplyID string) ([]SupplyMeasure, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, supply_id::text, name, base_quantity
+		   FROM supply_measures
+		  WHERE tenant_id = $1 AND supply_id = $2
+		  ORDER BY name`, tenantID, supplyID)
+	if pgCode(err, "22P02") {
+		return []SupplyMeasure{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []SupplyMeasure{}
+	for rows.Next() {
+		var m SupplyMeasure
+		if err := rows.Scan(&m.ID, &m.SupplyID, &m.Name, &m.BaseQuantity); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// createMeasure inserta una medida para un insumo del tenant. Nombre duplicado por
+// insumo => ErrNameTaken (UNIQUE supply_id,name). El insumo ya fue validado del
+// tenant en la capa service.
+func (s *store) createMeasure(ctx context.Context, tenantID, supplyID, name string, baseQuantity int) (SupplyMeasure, error) {
+	var m SupplyMeasure
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO supply_measures (tenant_id, supply_id, name, base_quantity)
+		 VALUES ($1, $2, $3, $4)
+		 RETURNING id::text, supply_id::text, name, base_quantity`,
+		tenantID, supplyID, name, baseQuantity).
+		Scan(&m.ID, &m.SupplyID, &m.Name, &m.BaseQuantity)
+	if pgCode(err, "23505") {
+		return SupplyMeasure{}, ErrNameTaken
+	}
+	return m, err
+}
+
+// updateMeasure aplica cambios parciales a una medida del tenant. Si baseQuantity
+// cambia, en la MISMA transacción recomputa el quantity_base de las recetas que usan
+// esta medida: quantity_base = GREATEST(1, ROUND(measure_count * nuevo)). Esto
+// propaga el "en vivo" a consumo y costo SIN tocar el descuento en venta (que sigue
+// leyendo quantity_base). uuid mal formado / ajeno => ErrNotFound.
+func (s *store) updateMeasure(ctx context.Context, tenantID, measureID string, name *string, baseQuantity *int) (SupplyMeasure, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SupplyMeasure{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var m SupplyMeasure
+	err = tx.QueryRow(ctx,
+		`UPDATE supply_measures
+		    SET name          = COALESCE($3, name),
+		        base_quantity = COALESCE($4, base_quantity)
+		  WHERE id = $1 AND tenant_id = $2
+		  RETURNING id::text, supply_id::text, name, base_quantity`,
+		measureID, tenantID, name, baseQuantity).
+		Scan(&m.ID, &m.SupplyID, &m.Name, &m.BaseQuantity)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
+		return SupplyMeasure{}, ErrNotFound
+	case pgCode(err, "23505"):
+		return SupplyMeasure{}, ErrNameTaken
+	case err != nil:
+		return SupplyMeasure{}, err
+	}
+
+	// Recompute-on-edit: solo cuando cambia baseQuantity. GREATEST(1, ...) respeta el
+	// CHECK(quantity_base > 0) aun con medidas/counts diminutos.
+	if baseQuantity != nil {
+		if _, err := tx.Exec(ctx,
+			`UPDATE product_supplies
+			    SET quantity_base = GREATEST(1, ROUND(measure_count * $2))
+			  WHERE measure_id = $1 AND tenant_id = $3`,
+			measureID, *baseQuantity, tenantID); err != nil {
+			return SupplyMeasure{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return SupplyMeasure{}, err
+	}
+	return m, nil
+}
+
+// deleteMeasure borra una medida del tenant. ON DELETE SET NULL en product_supplies:
+// las recetas que la usaban conservan su quantity_base "congelado" (measure_id/
+// measure_count quedan NULL). uuid mal formado / ajeno => ErrNotFound.
+func (s *store) deleteMeasure(ctx context.Context, tenantID, measureID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM supply_measures WHERE id = $1 AND tenant_id = $2`,
+		measureID, tenantID)
+	if pgCode(err, "22P02") {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// measureForSupply devuelve base_quantity de una medida SI pertenece al insumo y al
+// tenant indicados. ok=false (sin error) si no existe / uuid mal formado / ajena.
+func (s *store) measureForSupply(ctx context.Context, tenantID, supplyID, measureID string) (int, bool, error) {
+	var base int
+	err := s.pool.QueryRow(ctx,
+		`SELECT base_quantity FROM supply_measures
+		  WHERE id = $1 AND supply_id = $2 AND tenant_id = $3`,
+		measureID, supplyID, tenantID).Scan(&base)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
+		return 0, false, nil
+	case err != nil:
+		return 0, false, err
+	}
+	return base, true, nil
+}
+
+// supplyInTenant indica si el insumo pertenece al tenant. uuid mal formado => false.
+func (s *store) supplyInTenant(ctx context.Context, tenantID, supplyID string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM supplies WHERE id = $1 AND tenant_id = $2)`,
+		supplyID, tenantID).Scan(&ok)
+	if pgCode(err, "22P02") {
+		return false, nil
+	}
+	return ok, err
+}
+
 // ---- Recetas (globales) ----------------------------------------------------
 
 // productInTenant indica si el producto es del tenant. uuid mal formado => false.
@@ -361,9 +541,12 @@ func (s *store) productInTenant(ctx context.Context, tenantID, productID string)
 
 func (s *store) getRecipe(ctx context.Context, tenantID, productID string) ([]RecipeItem, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT ps.supply_id::text, sp.name, sp.base_unit, ps.quantity_base
+		`SELECT ps.supply_id::text, sp.name, sp.base_unit, ps.quantity_base,
+		        ps.measure_id::text, m.name,
+		        CASE WHEN ps.measure_id IS NOT NULL THEN ps.measure_count END
 		   FROM product_supplies ps
 		   JOIN supplies sp ON sp.id = ps.supply_id
+		   LEFT JOIN supply_measures m ON m.id = ps.measure_id
 		  WHERE ps.tenant_id = $1 AND ps.product_id = $2
 		  ORDER BY sp.name`, tenantID, productID)
 	if pgCode(err, "22P02") {
@@ -377,7 +560,8 @@ func (s *store) getRecipe(ctx context.Context, tenantID, productID string) ([]Re
 	var out []RecipeItem
 	for rows.Next() {
 		var it RecipeItem
-		if err := rows.Scan(&it.SupplyID, &it.SupplyName, &it.BaseUnit, &it.QuantityBase); err != nil {
+		if err := rows.Scan(&it.SupplyID, &it.SupplyName, &it.BaseUnit, &it.QuantityBase,
+			&it.MeasureID, &it.MeasureName, &it.MeasureCount); err != nil {
 			return nil, err
 		}
 		out = append(out, it)
@@ -385,10 +569,15 @@ func (s *store) getRecipe(ctx context.Context, tenantID, productID string) ([]Re
 	return out, rows.Err()
 }
 
-// recipeItemIn es la entrada de una línea de receta a persistir.
+// recipeItemIn es la entrada de una línea de receta a persistir. Si MeasureID viene,
+// la línea se capturó por medida y QuantityBase ya fue computado (ROUND(count*base))
+// y validado (>= 1) en la capa service; MeasureCount se persiste como registro del
+// "cómo se capturó". Si MeasureID es nil, es una línea en unidad base (como hoy).
 type recipeItemIn struct {
 	SupplyID     string
 	QuantityBase int
+	MeasureID    *string
+	MeasureCount *float64
 }
 
 // replaceRecipe reemplaza la receta completa del producto en una transacción
@@ -412,11 +601,11 @@ func (s *store) replaceRecipe(ctx context.Context, tenantID, productID string, i
 		// Cada insumo debe ser del tenant: el INSERT ... SELECT solo produce fila si
 		// el insumo existe en el tenant; 0 filas => insumo ajeno/inexistente.
 		tag, err := tx.Exec(ctx,
-			`INSERT INTO product_supplies (tenant_id, product_id, supply_id, quantity_base)
-			 SELECT $1, $2, sp.id, $4
+			`INSERT INTO product_supplies (tenant_id, product_id, supply_id, quantity_base, measure_id, measure_count)
+			 SELECT $1, $2, sp.id, $4, $5, $6
 			   FROM supplies sp
 			  WHERE sp.id = $3 AND sp.tenant_id = $1`,
-			tenantID, productID, it.SupplyID, it.QuantityBase)
+			tenantID, productID, it.SupplyID, it.QuantityBase, it.MeasureID, it.MeasureCount)
 		if pgCode(err, "22P02") { // uuid mal formado
 			return nil, ErrInvalidSupply
 		}
@@ -429,9 +618,12 @@ func (s *store) replaceRecipe(ctx context.Context, tenantID, productID string, i
 	}
 
 	rows, err := tx.Query(ctx,
-		`SELECT ps.supply_id::text, sp.name, sp.base_unit, ps.quantity_base
+		`SELECT ps.supply_id::text, sp.name, sp.base_unit, ps.quantity_base,
+		        ps.measure_id::text, m.name,
+		        CASE WHEN ps.measure_id IS NOT NULL THEN ps.measure_count END
 		   FROM product_supplies ps
 		   JOIN supplies sp ON sp.id = ps.supply_id
+		   LEFT JOIN supply_measures m ON m.id = ps.measure_id
 		  WHERE ps.tenant_id = $1 AND ps.product_id = $2
 		  ORDER BY sp.name`, tenantID, productID)
 	if err != nil {
@@ -440,7 +632,8 @@ func (s *store) replaceRecipe(ctx context.Context, tenantID, productID string, i
 	var out []RecipeItem
 	for rows.Next() {
 		var it RecipeItem
-		if err := rows.Scan(&it.SupplyID, &it.SupplyName, &it.BaseUnit, &it.QuantityBase); err != nil {
+		if err := rows.Scan(&it.SupplyID, &it.SupplyName, &it.BaseUnit, &it.QuantityBase,
+			&it.MeasureID, &it.MeasureName, &it.MeasureCount); err != nil {
 			rows.Close()
 			return nil, err
 		}

@@ -41,8 +41,8 @@ func setup(t *testing.T) *fixture {
 		t.Skipf("DB de test no disponible: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`TRUNCATE supply_movements, supply_branch_stock, product_supplies, supplies,
-		 supply_categories, sale_items, sales, user_branches, products, categories,
+		`TRUNCATE supply_movements, supply_branch_stock, product_supplies, supply_measures,
+		 supplies, supply_categories, sale_items, sales, user_branches, products, categories,
 		 customers, users, branches, tenants RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -709,5 +709,428 @@ func TestRecipeReplaceAll(t *testing.T) {
 	}
 	if len(empty) != 0 {
 		t.Fatalf("vaciar receta: esperaba 0 items, obtuvo %d", len(empty))
+	}
+}
+
+// psRow lee (quantity_base, measure_id, measure_count) de la fila de receta de un
+// producto+insumo. Devuelve qb=-1 si no hay fila.
+func (f *fixture) psRow(t *testing.T, productID, supplyID string) (int, *string, *float64) {
+	t.Helper()
+	var qb int
+	var mID *string
+	var mCount *float64
+	err := f.pool.QueryRow(context.Background(),
+		`SELECT quantity_base, measure_id::text, measure_count
+		   FROM product_supplies WHERE product_id=$1 AND supply_id=$2`,
+		productID, supplyID).Scan(&qb, &mID, &mCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return -1, nil, nil
+	}
+	if err != nil {
+		t.Fatalf("psRow: %v", err)
+	}
+	return qb, mID, mCount
+}
+
+// simulateSaleDeduct replica el SQL crítico de deductSupplies (internal/sales/
+// store.go): lee product_supplies.quantity_base, escribe un movimiento 'sale'
+// negativo y decrementa el cache. Se usa para probar la REGRESIÓN sin importar el
+// paquete sales: el descuento sigue leyendo quantity_base, intacto ante recetas por
+// medida. Devuelve el nuevo stock del insumo en la sucursal.
+func (f *fixture) simulateSaleDeduct(t *testing.T, tenantID, productID, branchID string, qty int) {
+	t.Helper()
+	var saleID string
+	if err := f.pool.QueryRow(context.Background(),
+		`INSERT INTO sales (tenant_id, branch_id, total_cents, payment_method, amount_paid_cents, change_cents)
+		 VALUES ($1,$2,0,'cash',0,0) RETURNING id::text`, tenantID, branchID).Scan(&saleID); err != nil {
+		t.Fatalf("seed sale: %v", err)
+	}
+	if _, err := f.pool.Exec(context.Background(),
+		`WITH lineas AS (
+		     SELECT product_id, qty FROM unnest($4::uuid[], $5::int[]) AS u(product_id, qty)
+		 ),
+		 consumo AS (
+		     SELECT ps.supply_id, SUM(ps.quantity_base * l.qty)::int AS total
+		       FROM lineas l JOIN product_supplies ps
+		         ON ps.product_id = l.product_id AND ps.tenant_id = $1
+		   GROUP BY ps.supply_id
+		 ),
+		 mov AS (
+		     INSERT INTO supply_movements (tenant_id, supply_id, branch_id, type, quantity_base, sale_id)
+		     SELECT $1, supply_id, $3, 'sale', -total, $2 FROM consumo
+		     RETURNING supply_id, quantity_base
+		 )
+		 INSERT INTO supply_branch_stock (tenant_id, supply_id, branch_id, stock_base)
+		 SELECT $1, supply_id, $3, quantity_base FROM mov ORDER BY supply_id
+		 ON CONFLICT (supply_id, branch_id) DO UPDATE
+		    SET stock_base = supply_branch_stock.stock_base + EXCLUDED.stock_base, updated_at = now()`,
+		tenantID, saleID, branchID, []string{productID}, []int{qty}); err != nil {
+		t.Fatalf("simulateSaleDeduct: %v", err)
+	}
+}
+
+// TestSupplyMeasureCRUD cubre el CRUD de medidas: creación, baseQuantity<=0
+// (validación), name_taken por insumo, medida en insumo ajeno (not found),
+// actualización parcial, borrado y aislamiento por tenant.
+func TestSupplyMeasureCRUD(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	choco, _ := f.svc.Create(ctx, f.tenantA, "Chocolate", "g", "Bolsa 1kg", 1000, nil, nil)
+
+	// Crear medida "scoop = 25 g".
+	scoop, err := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "  scoop  ", 25)
+	if err != nil {
+		t.Fatalf("crear medida: %v", err)
+	}
+	if scoop.Name != "scoop" || scoop.BaseQuantity != 25 || scoop.SupplyID != choco.ID {
+		t.Fatalf("medida inesperada: %+v", scoop)
+	}
+
+	// baseQuantity <= 0 -> validación.
+	if _, err := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "mal", 0); !errors.Is(err, ErrValidation) {
+		t.Fatalf("baseQuantity 0: esperaba ErrValidation, obtuvo %v", err)
+	}
+	// Nombre vacío -> validación.
+	if _, err := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "   ", 10); !errors.Is(err, ErrValidation) {
+		t.Fatalf("nombre vacío: esperaba ErrValidation, obtuvo %v", err)
+	}
+	// Nombre duplicado por insumo -> name_taken (UNIQUE supply_id,name).
+	if _, err := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "scoop", 30); !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("nombre duplicado: esperaba ErrNameTaken, obtuvo %v", err)
+	}
+	// Medida en insumo de OTRO tenant -> not found.
+	supB, _ := f.svc.Create(ctx, f.tenantB, "ChocoB", "g", "Bolsa", 1000, nil, nil)
+	if _, err := f.svc.CreateMeasure(ctx, f.tenantA, supB.ID, "scoop", 25); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("insumo ajeno: esperaba ErrNotFound, obtuvo %v", err)
+	}
+
+	// Segunda medida en el mismo insumo (cucharada = 12 g).
+	if _, err := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "cucharada", 12); err != nil {
+		t.Fatalf("2ª medida: %v", err)
+	}
+	// ListMeasures devuelve ambas, ordenadas por nombre.
+	list, err := f.svc.ListMeasures(ctx, f.tenantA, choco.ID)
+	if err != nil {
+		t.Fatalf("list medidas: %v", err)
+	}
+	if len(list) != 2 || list[0].Name != "cucharada" || list[1].Name != "scoop" {
+		t.Fatalf("list medidas inesperado: %+v", list)
+	}
+	// ListMeasures de insumo ajeno -> not found.
+	if _, err := f.svc.ListMeasures(ctx, f.tenantB, choco.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("list medidas ajeno: esperaba ErrNotFound, obtuvo %v", err)
+	}
+
+	// Las medidas aparecen embebidas en Get y List del insumo (siempre array).
+	got, _ := f.svc.Get(ctx, f.tenantA, choco.ID)
+	if len(got.Measures) != 2 {
+		t.Fatalf("Get.Measures esperaba 2, obtuvo %d", len(got.Measures))
+	}
+	items, _ := f.svc.List(ctx, f.tenantA)
+	for _, it := range items {
+		if it.ID == choco.ID && len(it.Measures) != 2 {
+			t.Fatalf("List.Measures esperaba 2, obtuvo %d", len(it.Measures))
+		}
+		if it.Measures == nil {
+			t.Fatalf("List.Measures debía ser array, no nil (insumo %s)", it.Name)
+		}
+	}
+
+	// Update parcial: renombrar sin tocar baseQuantity.
+	newName := "scoop grande"
+	upd, err := f.svc.UpdateMeasure(ctx, f.tenantA, scoop.ID, MeasureUpdate{Name: &newName})
+	if err != nil {
+		t.Fatalf("update medida: %v", err)
+	}
+	if upd.Name != "scoop grande" || upd.BaseQuantity != 25 {
+		t.Fatalf("update medida inesperado: %+v", upd)
+	}
+	// baseQuantity <= 0 en update -> validación.
+	zero := 0
+	if _, err := f.svc.UpdateMeasure(ctx, f.tenantA, scoop.ID, MeasureUpdate{BaseQuantity: &zero}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("update baseQuantity 0: esperaba ErrValidation, obtuvo %v", err)
+	}
+	// Medida de otro tenant -> not found.
+	if _, err := f.svc.UpdateMeasure(ctx, f.tenantB, scoop.ID, MeasureUpdate{Name: &newName}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update medida ajena: esperaba ErrNotFound, obtuvo %v", err)
+	}
+
+	// Delete: medida ajena -> not found; propia -> ok; doble delete -> not found.
+	if err := f.svc.DeleteMeasure(ctx, f.tenantB, scoop.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete medida ajena: esperaba ErrNotFound, obtuvo %v", err)
+	}
+	if err := f.svc.DeleteMeasure(ctx, f.tenantA, scoop.ID); err != nil {
+		t.Fatalf("delete medida: %v", err)
+	}
+	if err := f.svc.DeleteMeasure(ctx, f.tenantA, scoop.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete doble: esperaba ErrNotFound, obtuvo %v", err)
+	}
+}
+
+// TestRecipeByMeasure cubre capturar una línea de receta por medida: quantity_base =
+// round(count * base); persistencia de measure_id/measure_count; getRecipe devuelve
+// measureName/measureCount; y la medida debe pertenecer al insumo (invalid_measure).
+func TestRecipeByMeasure(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	choco, _ := f.svc.Create(ctx, f.tenantA, "Chocolate", "g", "Bolsa 1kg", 1000, nil, nil)
+	scoop, _ := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "scoop", 25)
+	count := 2.0 // 2 scoops = 50 g
+
+	out, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &scoop.ID, MeasureCount: &count},
+	})
+	if err != nil {
+		t.Fatalf("receta por medida: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("esperaba 1 item, obtuvo %d", len(out))
+	}
+	it := out[0]
+	if it.QuantityBase != 50 {
+		t.Fatalf("quantity_base esperaba 50 (2*25), obtuvo %d", it.QuantityBase)
+	}
+	if it.MeasureID == nil || *it.MeasureID != scoop.ID {
+		t.Fatalf("measureId esperaba %s, obtuvo %v", scoop.ID, it.MeasureID)
+	}
+	if it.MeasureName == nil || *it.MeasureName != "scoop" {
+		t.Fatalf("measureName esperaba scoop, obtuvo %v", it.MeasureName)
+	}
+	if it.MeasureCount == nil || *it.MeasureCount != 2.0 {
+		t.Fatalf("measureCount esperaba 2, obtuvo %v", it.MeasureCount)
+	}
+
+	// Persistencia: la fila guarda measure_id + measure_count + quantity_base.
+	qb, mID, mCount := f.psRow(t, f.prodA, choco.ID)
+	if qb != 50 || mID == nil || *mID != scoop.ID || mCount == nil || *mCount != 2.0 {
+		t.Fatalf("persistencia: qb=%d mID=%v mCount=%v", qb, mID, mCount)
+	}
+
+	// getRecipe round-trip.
+	got, _ := f.svc.GetRecipe(ctx, f.tenantA, f.prodA)
+	if len(got) != 1 || got[0].QuantityBase != 50 || got[0].MeasureName == nil || *got[0].MeasureName != "scoop" {
+		t.Fatalf("getRecipe round-trip: %+v", got)
+	}
+
+	// Medida que NO pertenece a ese insumo -> invalid_measure. (Medida de otro insumo.)
+	otro, _ := f.svc.Create(ctx, f.tenantA, "Vainilla", "g", "Bolsa", 500, nil, nil)
+	otroScoop, _ := f.svc.CreateMeasure(ctx, f.tenantA, otro.ID, "scoop", 20)
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &otroScoop.ID, MeasureCount: &count},
+	}); !errors.Is(err, ErrInvalidMeasure) {
+		t.Fatalf("medida de otro insumo: esperaba ErrInvalidMeasure, obtuvo %v", err)
+	}
+
+	// Mezcla: una línea por medida y otra en unidad base (measureId nil) conviven.
+	azucar, _ := f.svc.Create(ctx, f.tenantA, "Azúcar", "g", "Bolsa", 1000, nil, nil)
+	mixed, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &scoop.ID, MeasureCount: &count},
+		{SupplyID: azucar.ID, QuantityBase: 10},
+	})
+	if err != nil {
+		t.Fatalf("receta mixta: %v", err)
+	}
+	byName := map[string]RecipeItem{}
+	for _, r := range mixed {
+		byName[r.SupplyName] = r
+	}
+	if byName["Azúcar"].MeasureID != nil || byName["Azúcar"].QuantityBase != 10 {
+		t.Fatalf("línea unidad base inesperada: %+v", byName["Azúcar"])
+	}
+	if byName["Chocolate"].MeasureID == nil || byName["Chocolate"].QuantityBase != 50 {
+		t.Fatalf("línea por medida inesperada: %+v", byName["Chocolate"])
+	}
+}
+
+// TestMeasureEditRecomputesRecipe es el TEST CENTRAL: editar el baseQuantity de una
+// medida recomputa, en la misma transacción, el quantity_base de las recetas que la
+// usan (recálculo en vivo hacia consumo y costo). El descuento en venta lee ese
+// quantity_base, así que también se propaga sin tocar deductSupplies.
+func TestMeasureEditRecomputesRecipe(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	choco, _ := f.svc.Create(ctx, f.tenantA, "Chocolate", "g", "Bolsa 1kg", 1000, nil, nil)
+	scoop, _ := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "scoop", 25)
+
+	// Receta A: 1 scoop -> 25 g. Receta B (otro producto): 2 scoops -> 50 g.
+	one, two := 1.0, 2.0
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &scoop.ID, MeasureCount: &one},
+	}); err != nil {
+		t.Fatalf("receta A: %v", err)
+	}
+	var prodA2 string
+	if err := f.pool.QueryRow(ctx,
+		"INSERT INTO products (tenant_id, name, price_cents) VALUES ($1,'Mocha',6000) RETURNING id::text", f.tenantA).Scan(&prodA2); err != nil {
+		t.Fatalf("seed prodA2: %v", err)
+	}
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, prodA2, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &scoop.ID, MeasureCount: &two},
+	}); err != nil {
+		t.Fatalf("receta B: %v", err)
+	}
+
+	// Precondición: qb A=25, qb B=50.
+	if qb, _, _ := f.psRow(t, f.prodA, choco.ID); qb != 25 {
+		t.Fatalf("precondición A: esperaba 25, obtuvo %d", qb)
+	}
+	if qb, _, _ := f.psRow(t, prodA2, choco.ID); qb != 50 {
+		t.Fatalf("precondición B: esperaba 50, obtuvo %d", qb)
+	}
+
+	// Editar la medida: scoop 25 g -> 30 g. Recálculo en vivo.
+	newBase := 30
+	upd, err := f.svc.UpdateMeasure(ctx, f.tenantA, scoop.ID, MeasureUpdate{BaseQuantity: &newBase})
+	if err != nil {
+		t.Fatalf("editar medida: %v", err)
+	}
+	if upd.BaseQuantity != 30 {
+		t.Fatalf("baseQuantity tras update esperaba 30, obtuvo %d", upd.BaseQuantity)
+	}
+
+	// AMBAS recetas recomputadas: A=30 (1*30), B=60 (2*30). measure_count intacto.
+	if qb, _, mc := f.psRow(t, f.prodA, choco.ID); qb != 30 || mc == nil || *mc != 1.0 {
+		t.Fatalf("recálculo A: esperaba qb=30 count=1, obtuvo qb=%d count=%v", qb, mc)
+	}
+	if qb, _, mc := f.psRow(t, prodA2, choco.ID); qb != 60 || mc == nil || *mc != 2.0 {
+		t.Fatalf("recálculo B: esperaba qb=60 count=2, obtuvo qb=%d count=%v", qb, mc)
+	}
+
+	// Editar SOLO el nombre no recomputa quantity_base.
+	renamed := "scoop chico"
+	if _, err := f.svc.UpdateMeasure(ctx, f.tenantA, scoop.ID, MeasureUpdate{Name: &renamed}); err != nil {
+		t.Fatalf("rename medida: %v", err)
+	}
+	if qb, _, _ := f.psRow(t, f.prodA, choco.ID); qb != 30 {
+		t.Fatalf("rename no debía tocar qb: esperaba 30, obtuvo %d", qb)
+	}
+}
+
+// TestDeleteMeasureFreezesRecipe: borrar una medida en uso deja el quantity_base
+// "congelado" (no cambia) y measure_id/measure_count en NULL (ON DELETE SET NULL).
+func TestDeleteMeasureFreezesRecipe(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	choco, _ := f.svc.Create(ctx, f.tenantA, "Chocolate", "g", "Bolsa 1kg", 1000, nil, nil)
+	scoop, _ := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "scoop", 25)
+	count := 2.0
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &scoop.ID, MeasureCount: &count},
+	}); err != nil {
+		t.Fatalf("receta: %v", err)
+	}
+	if qb, _, _ := f.psRow(t, f.prodA, choco.ID); qb != 50 {
+		t.Fatalf("precondición: esperaba qb=50, obtuvo %d", qb)
+	}
+
+	// Borrar la medida.
+	if err := f.svc.DeleteMeasure(ctx, f.tenantA, scoop.ID); err != nil {
+		t.Fatalf("borrar medida: %v", err)
+	}
+
+	// quantity_base congelado en 50; measure_id en NULL (ON DELETE SET NULL solo anula
+	// la FK; la columna cruda measure_count conserva su valor histórico, pero la API lo
+	// oculta al no haber measure_id — se verifica abajo vía getRecipe).
+	qb, mID, _ := f.psRow(t, f.prodA, choco.ID)
+	if qb != 50 {
+		t.Fatalf("congelado: quantity_base esperaba 50, obtuvo %d", qb)
+	}
+	if mID != nil {
+		t.Fatalf("congelado: measure_id esperaba NULL, obtuvo %v", mID)
+	}
+	// getRecipe: measureId/measureName/measureCount todos nil, quantity_base sigue 50.
+	got, _ := f.svc.GetRecipe(ctx, f.tenantA, f.prodA)
+	if len(got) != 1 || got[0].QuantityBase != 50 || got[0].MeasureID != nil || got[0].MeasureName != nil || got[0].MeasureCount != nil {
+		t.Fatalf("getRecipe tras borrar medida: %+v", got)
+	}
+}
+
+// TestRecipeMeasureRoundsToZero: si round(count * base) < 1 (redondea a 0), la línea
+// no tiene sentido físico y viola el CHECK(quantity_base>0) -> validation_error.
+func TestRecipeMeasureRoundsToZero(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	choco, _ := f.svc.Create(ctx, f.tenantA, "Chocolate", "g", "Bolsa", 1000, nil, nil)
+	tiny, _ := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "pizca", 1) // 1 g por pizca
+	small := 0.4                                                         // round(0.4*1)=0
+
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &tiny.ID, MeasureCount: &small},
+	}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("round a 0: esperaba ErrValidation, obtuvo %v", err)
+	}
+	// measureCount <= 0 -> validación.
+	zero := 0.0
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &tiny.ID, MeasureCount: &zero},
+	}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("measureCount 0: esperaba ErrValidation, obtuvo %v", err)
+	}
+	// round(0.5*1)=1 (Go math.Round redondea 0.5 hacia arriba en magnitud) -> válido.
+	half := 0.5
+	out, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &tiny.ID, MeasureCount: &half},
+	})
+	if err != nil {
+		t.Fatalf("round 0.5->1: %v", err)
+	}
+	if out[0].QuantityBase != 1 {
+		t.Fatalf("round 0.5*1: esperaba qb=1, obtuvo %d", out[0].QuantityBase)
+	}
+}
+
+// TestSaleDeductsByMeasureQuantityBase es la REGRESIÓN: una venta de un producto con
+// receta capturada por medida sigue descontando correctamente leyendo quantity_base
+// (deductSupplies intacto). También verifica que, tras editar la medida (recálculo en
+// vivo), una nueva venta descuenta con el quantity_base recomputado.
+func TestSaleDeductsByMeasureQuantityBase(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	choco, _ := f.svc.Create(ctx, f.tenantA, "Chocolate", "g", "Bolsa 1kg", 1000, nil, nil)
+	scoop, _ := f.svc.CreateMeasure(ctx, f.tenantA, choco.ID, "scoop", 25)
+	one := 1.0
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: choco.ID, MeasureID: &scoop.ID, MeasureCount: &one},
+	}); err != nil {
+		t.Fatalf("receta por medida: %v", err)
+	}
+	// Existencias iniciales: 1000 g en A1.
+	pkgs := 1
+	if _, _, err := f.svc.CreateMovement(ctx, f.tenantA, choco.ID, MovementInput{
+		Type: "purchase", BranchID: f.branchA1, Packages: &pkgs,
+	}, f.userA); err != nil {
+		t.Fatalf("compra inicial: %v", err)
+	}
+
+	// Vender 2 unidades del producto: descuenta 2 * quantity_base(25) = 50 g.
+	f.simulateSaleDeduct(t, f.tenantA, f.prodA, f.branchA1, 2)
+	if got := f.cacheStock(t, choco.ID, f.branchA1); got != 950 {
+		t.Fatalf("descuento por medida: esperaba stock 950 (1000-50), obtuvo %d", got)
+	}
+	// Invariante ledger == cache.
+	if got, want := f.cacheStock(t, choco.ID, f.branchA1), f.sumMovements(t, choco.ID, f.branchA1); got != want {
+		t.Fatalf("invariante rota: cache=%d suma=%d", got, want)
+	}
+
+	// Editar la medida a 30 g (recálculo en vivo) -> nueva venta descuenta 30 g/unidad.
+	newBase := 30
+	if _, err := f.svc.UpdateMeasure(ctx, f.tenantA, scoop.ID, MeasureUpdate{BaseQuantity: &newBase}); err != nil {
+		t.Fatalf("editar medida: %v", err)
+	}
+	f.simulateSaleDeduct(t, f.tenantA, f.prodA, f.branchA1, 1) // 1 * 30 = 30
+	if got := f.cacheStock(t, choco.ID, f.branchA1); got != 920 {
+		t.Fatalf("descuento tras recálculo: esperaba stock 920 (950-30), obtuvo %d", got)
 	}
 }

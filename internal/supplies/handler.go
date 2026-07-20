@@ -24,14 +24,20 @@ func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) 
 		r.Get("/", svc.handleList)
 		r.Get("/categories", svc.handleListCategories)
 		r.Get("/recipes/{productId}", svc.handleGetRecipe)
+		r.Get("/{id}/measures", svc.handleListMeasures)
 		r.Get("/{id}", svc.handleGet)
 	})
-	// Escritura: solo super admin.
+	// Escritura: solo super admin. Las rutas con segmento estático /measures/{measureId}
+	// (medida por id, sin insumo en el path) se registran junto a /{id}/measures (medidas
+	// de un insumo); chi prioriza el literal "measures" sobre el path param {id}.
 	r.Group(func(r chi.Router) {
 		r.Use(requireSuperAdmin)
 		r.Post("/", svc.handleCreate)
 		r.Post("/categories", svc.handleCreateCategory)
 		r.Patch("/categories/{id}", svc.handleUpdateCategory)
+		r.Post("/{id}/measures", svc.handleCreateMeasure)
+		r.Patch("/measures/{measureId}", svc.handleUpdateMeasure)
+		r.Delete("/measures/{measureId}", svc.handleDeleteMeasure)
 		r.Patch("/{id}", svc.handleUpdate)
 		r.Post("/{id}/movements", svc.handleCreateMovement)
 		r.Get("/{id}/movements", svc.handleListMovements)
@@ -291,6 +297,104 @@ func (svc *Service) handleListMovements(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// ---- Medidas de uso --------------------------------------------------------
+
+func (svc *Service) handleListMeasures(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	items, err := svc.ListMeasures(r.Context(), tenantID, chi.URLParam(r, "id"))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Insumo no encontrado")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar las medidas")
+	default:
+		if items == nil {
+			items = []SupplyMeasure{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	}
+}
+
+type measureRequest struct {
+	Name         string `json:"name"`
+	BaseQuantity int    `json:"baseQuantity"`
+}
+
+func (svc *Service) handleCreateMeasure(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	var req measureRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
+		return
+	}
+	m, err := svc.CreateMeasure(r.Context(), tenantID, chi.URLParam(r, "id"), req.Name, req.BaseQuantity)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Insumo no encontrado")
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "El nombre y la equivalencia son requeridos")
+	case errors.Is(err, ErrNameTaken):
+		writeError(w, http.StatusConflict, "name_taken", "Ya existe una medida con ese nombre")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo crear la medida")
+	default:
+		writeJSON(w, http.StatusCreated, map[string]any{"measure": m})
+	}
+}
+
+type measureUpdateRequest struct {
+	Name         *string `json:"name"`
+	BaseQuantity *int    `json:"baseQuantity"`
+}
+
+func (svc *Service) handleUpdateMeasure(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	var req measureUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
+		return
+	}
+	m, err := svc.UpdateMeasure(r.Context(), tenantID, chi.URLParam(r, "measureId"),
+		MeasureUpdate{Name: req.Name, BaseQuantity: req.BaseQuantity})
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "Datos inválidos")
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Medida no encontrada")
+	case errors.Is(err, ErrNameTaken):
+		writeError(w, http.StatusConflict, "name_taken", "Ya existe una medida con ese nombre")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo actualizar la medida")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"measure": m})
+	}
+}
+
+func (svc *Service) handleDeleteMeasure(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	err := svc.DeleteMeasure(r.Context(), tenantID, chi.URLParam(r, "measureId"))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Medida no encontrada")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo borrar la medida")
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 // ---- Recetas ---------------------------------------------------------------
 
 func (svc *Service) handleGetRecipe(w http.ResponseWriter, r *http.Request) {
@@ -311,8 +415,10 @@ func (svc *Service) handleGetRecipe(w http.ResponseWriter, r *http.Request) {
 
 type recipeRequest struct {
 	Items []struct {
-		SupplyID     string `json:"supplyId"`
-		QuantityBase int    `json:"quantityBase"`
+		SupplyID     string   `json:"supplyId"`
+		QuantityBase int      `json:"quantityBase"`
+		MeasureID    *string  `json:"measureId"`    // opcional: línea capturada por medida
+		MeasureCount *float64 `json:"measureCount"` // opcional: cantidad de medidas
 	} `json:"items"`
 }
 
@@ -328,7 +434,10 @@ func (svc *Service) handleReplaceRecipe(w http.ResponseWriter, r *http.Request) 
 	}
 	items := make([]recipeItemIn, 0, len(req.Items))
 	for _, it := range req.Items {
-		items = append(items, recipeItemIn{SupplyID: it.SupplyID, QuantityBase: it.QuantityBase})
+		items = append(items, recipeItemIn{
+			SupplyID: it.SupplyID, QuantityBase: it.QuantityBase,
+			MeasureID: it.MeasureID, MeasureCount: it.MeasureCount,
+		})
 	}
 	out, err := svc.ReplaceRecipe(r.Context(), tenantID, chi.URLParam(r, "productId"), items)
 	switch {
@@ -336,6 +445,8 @@ func (svc *Service) handleReplaceRecipe(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "not_found", "Producto no encontrado")
 	case errors.Is(err, ErrInvalidSupply):
 		writeError(w, http.StatusBadRequest, "invalid_supply", "Uno de los insumos no es válido")
+	case errors.Is(err, ErrInvalidMeasure):
+		writeError(w, http.StatusBadRequest, "invalid_measure", "Una de las medidas no es válida")
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Receta inválida")
 	case err != nil:
