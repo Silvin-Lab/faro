@@ -17,6 +17,7 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	r := chi.NewRouter()
 	r.Use(requireSession)
 	r.Get("/sales", svc.handleSalesReport)
+	r.Get("/sales/list", svc.handleSalesList)
 	r.Get("/expenses", svc.handleExpensesReport)
 	return r
 }
@@ -137,6 +138,26 @@ func (svc *Service) handleSalesReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rep)
+}
+
+// handleSalesList sirve la sección "Historial de ventas" del reporte — la UI
+// solo la muestra si el rango elegido es ≤48h, y el backend lo hace cumplir
+// también (guarda contra un caller que ignore el límite del frontend).
+func (svc *Service) handleSalesList(w http.ResponseWriter, r *http.Request) {
+	tenantID, from, to, branch, ok := svc.resolveReportScope(w, r)
+	if !ok {
+		return
+	}
+	if to.Sub(from) > 48*time.Hour {
+		writeError(w, http.StatusBadRequest, "range_too_large", "El historial de ventas solo está disponible para rangos de hasta 2 días")
+		return
+	}
+	items, err := svc.SalesList(r.Context(), tenantID, from, to, branch)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo listar las ventas")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func parseTime(s string) *time.Time {

@@ -22,3 +22,7 @@ func (svc *Service) SalesReport(ctx context.Context, tenantID string, from, to t
 func (svc *Service) ExpensesReport(ctx context.Context, tenantID string, from, to time.Time, branch BranchFilter) (ExpensesReport, error) {
 	return svc.store.expensesReport(ctx, tenantID, from, to, branch)
 }
+
+func (svc *Service) SalesList(ctx context.Context, tenantID string, from, to time.Time, branch BranchFilter) ([]SaleListItem, error) {
+	return svc.store.salesList(ctx, tenantID, from, to, branch)
+}

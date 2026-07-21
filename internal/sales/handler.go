@@ -122,8 +122,12 @@ func parseTime(s string) *time.Time {
 	return &t
 }
 
+// handleGet usa ResolveTenant (no TenantOf): a diferencia de crear/listar ventas
+// (solo personal de sucursal, siempre con tenant propio), el detalle de una
+// venta también lo consume el super admin global desde Reportes -> Historial de
+// ventas (clic en una fila), y ResolveTenant sabe resolverlo al negocio único.
 func (svc *Service) handleGet(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := auth.TenantOf(w, r)
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}

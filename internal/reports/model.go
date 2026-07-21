@@ -46,6 +46,17 @@ type BranchFilter struct {
 	ID   *string
 }
 
+// SaleListItem es una fila del listado de ventas individuales del reporte
+// (sección "Historial de ventas", acotada a rangos ≤48h — ver handler). El
+// detalle completo (items) se obtiene aparte con GET /sales/{id}.
+type SaleListItem struct {
+	ID            string  `json:"id"`
+	CreatedAt     string  `json:"createdAt"`
+	CustomerName  *string `json:"customerName"`
+	TotalCents    int     `json:"totalCents"`
+	PaymentMethod string  `json:"paymentMethod"`
+}
+
 type SalesReport struct {
 	TotalCents      int                 `json:"totalCents"`
 	SalesCount      int                 `json:"salesCount"`

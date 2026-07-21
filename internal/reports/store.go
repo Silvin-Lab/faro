@@ -189,6 +189,36 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 	return rep, brRows.Err()
 }
 
+// salesList devuelve las ventas individuales del negocio en [from, to), más
+// recientes primero (sección "Historial de ventas" del reporte — el handler
+// acota el rango a ≤48h antes de llamar esto). LIMIT 500 de resguardo.
+func (s *store) salesList(ctx context.Context, tenantID string, from, to time.Time, branch BranchFilter) ([]SaleListItem, error) {
+	cond, args := branchClause("s.", 4, branch)
+	rows, err := s.pool.Query(ctx,
+		`SELECT s.id::text, s.created_at, (cu.first_name || ' ' || cu.last_name), s.total_cents, s.payment_method
+		   FROM sales s
+		   LEFT JOIN customers cu ON cu.id = s.customer_id
+		  WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $3`+cond+`
+		  ORDER BY s.created_at DESC
+		  LIMIT 500`,
+		append([]any{tenantID, from, to}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SaleListItem{}
+	for rows.Next() {
+		var it SaleListItem
+		var createdAt time.Time
+		if err := rows.Scan(&it.ID, &createdAt, &it.CustomerName, &it.TotalCents, &it.PaymentMethod); err != nil {
+			return nil, err
+		}
+		it.CreatedAt = createdAt.Format(time.RFC3339)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // expensesReport agrega los gastos del negocio en [from, to). branch acota
 // opcionalmente a una sucursal. Reutiliza branchClause (mismo contrato que ventas).
 func (s *store) expensesReport(ctx context.Context, tenantID string, from, to time.Time, branch BranchFilter) (ExpensesReport, error) {
