@@ -323,15 +323,7 @@ func (s *store) insertMovement(ctx context.Context, tenantID, supplyID, branchID
 		return Movement{}, 0, err
 	}
 
-	var stockBase int
-	err = tx.QueryRow(ctx,
-		`INSERT INTO supply_branch_stock (tenant_id, supply_id, branch_id, stock_base)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (supply_id, branch_id)
-		 DO UPDATE SET stock_base = supply_branch_stock.stock_base + EXCLUDED.stock_base,
-		               updated_at = now()
-		 RETURNING stock_base`,
-		tenantID, supplyID, branchID, delta).Scan(&stockBase)
+	stockBase, err := UpsertBranchStock(ctx, tx, tenantID, supplyID, branchID, delta)
 	if err != nil {
 		return Movement{}, 0, err
 	}

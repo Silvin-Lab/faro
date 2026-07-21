@@ -65,6 +65,20 @@ faro/  (backend)                     faro-ui/  (frontend)
   cross-origin). Expuesto vía `GET /auth/me`/login extendidos (`tenant{}`, `branches`,
   `activeBranchId`).
 
+## Almacén central (M8 — ver ADR-008)
+- **Almacén único por negocio** (`tenant`), intermedio entre "comprar" y "la sucursal
+  consume el insumo". Es una **entidad de datos nueva** (`warehouse_stock` +
+  `warehouse_movements`), **no** una sucursal virtual. Sus ítems son los mismos `supplies`.
+- **Dos dominios de stock separados**, cada uno con su ledger firmado y su invariante
+  `cache == SUM(ledger)`: almacén (`warehouse_stock`/`warehouse_movements`, tipos
+  `purchase | dispatch | waste`) y sucursal (`supply_branch_stock`/`supply_movements`,
+  existente).
+- **La salida (dispatch) cruza ambos dominios** en una transacción: resta del almacén y
+  suma a la sucursal destino como un `supply_movement` tipo **`transfer`** (nuevo, positivo,
+  ligado por FK `warehouse_movement_id`). Complementa —no colisiona con— el descuento por
+  venta (`deductSupplies`, que resta). Detalle en ADR-008 y `modules/warehouse/tech-spec.md`.
+- **Módulo** `internal/warehouse` montado en `/warehouse`, gated a **super_admin**.
+
 ## Límites y contratos
 - **Web ↔ API:** REST/JSON. La cookie de sesión viaja en cada request (no hay tokens en localStorage).
 - **API ↔ DB:** acceso solo desde la API; el frontend nunca habla con la DB.

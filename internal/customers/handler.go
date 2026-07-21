@@ -16,15 +16,16 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	r := chi.NewRouter()
 	r.Use(requireSession)
 	r.Post("/", svc.handleCreate)
-	r.Get("/", svc.handleSearch)               // ?phone=<exacto> | ?q=<texto>&limit=20
+	r.Get("/", svc.handleSearch)               // ?phone=<exacto> | ?q=<texto>&limit=20 | ?limit=20&offset=0 (listado)
 	r.Patch("/{id}/visits", svc.handleSetVisits) // ajuste manual (migración de tarjetas): solo admin
 	return r
 }
 
 type createRequest struct {
-	Phone     string `json:"phone"`
-	FirstName string `json:"firstName"`
-	LastName  string `json:"lastName"`
+	Phone       string `json:"phone"`
+	FirstName   string `json:"firstName"`
+	LastName    string `json:"lastName"`
+	PriorVisits int    `json:"priorVisits"` // opcional; ausente en el JSON = 0
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +38,7 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
 		return
 	}
-	c, err := svc.Create(r.Context(), tenantID, req.Phone, req.FirstName, req.LastName)
+	c, err := svc.Create(r.Context(), tenantID, req.Phone, req.FirstName, req.LastName, req.PriorVisits)
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Teléfono, nombre y apellido son requeridos")
@@ -69,6 +70,20 @@ func (svc *Service) handleSearch(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeJSON(w, http.StatusOK, map[string]any{"items": items})
 		}
+		return
+	}
+
+	// Sin texto de búsqueda ni teléfono: listado paginado (default de la pantalla
+	// Clientes, "mostrar más" via offset).
+	if !q.Has("phone") {
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		offset, _ := strconv.Atoi(q.Get("offset"))
+		items, err := svc.List(r.Context(), tenantID, limit, offset)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "No se pudo listar clientes")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 		return
 	}
 

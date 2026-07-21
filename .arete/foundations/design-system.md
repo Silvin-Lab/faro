@@ -55,6 +55,15 @@ _Versión: 0.3 · Fecha: 2026-06-29 · Nace con: módulo login (M1) · Crece con
 - **Formulario:** label arriba, error debajo, acción principal a ancho completo en móvil/tablet.
 - **Feedback:** errores como inline/toast; mensajes genéricos en credenciales.
 
+## Extensiones — M8 Almacén (warehouse)
+_Añadido: 2026-07-20 (product-designer). Patrones nacidos al diseñar el módulo Almacén; reutilizables por otros módulos._
+- **Select field** — mismo look que `Input`: `w-full rounded-md border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-accent-strong`. Hoy vive como clase repetida (`selectClass`) en `supplies`; **formalizar como `components/ui/Select.tsx`**. Estados: default / focus / disabled. Siempre con `<label>` (via Form field).
+- **Date input** — `type=date` con los tokens de `Input`. Display de fechas `dd/mm/aaaa` (o con hora donde aplique).
+- **Alert / Callout banner** — banda a ancho completo dentro del área de contenido: icono + texto + acción (enlace). Radio `md`, borde claro. Variantes: **info** (fondo `--color-bg`) y **warning/atención** (acento sutil). Uso: alerta de reposición ("N insumos bajo su mínimo → Ver qué comprar"). Se muestra condicionalmente (oculto si no hay nada que alertar).
+- **Status badge** — pastilla `rounded px-2 py-0.5 text-xs`. Variantes: **OK/activo** (`bg-accent text-ink`), **atención/negativo** (`--color-danger`, tinte suave), **neutro/sin dato** (`bg-bg text-muted`). Generaliza el badge activo/inactivo ya usado en `supplies`.
+- **Sidebar section group** — primer uso real del Section header ya descrito: encabezado de sección muted (ej. "Almacén") + sus items agrupados debajo. El sidebar deja de ser una lista plana única y admite varios grupos.
+- **Tabla de historial** — patrón ya usado en `supplies/[id]/edit`, formalizado: contenedor `overflow-x-auto` + `min-w-[…]`; `thead` `border-b border-line text-xs uppercase tracking-wide text-muted`; `tbody` `divide-y divide-line`; números `tabular-nums`; cantidades negativas en `--color-danger`. Estado vacío: texto muted ("Sin … registrados.").
+
 ## Versionado
-- Estable: paleta BrightPOS (lime), tipografía (Inter/Poppins), tokens, Button (primary/outline/ghost), Input, Form field, Card, App shell (top bar + sidebar agrupado), Sidebar nav item, Section header.
+- Estable: paleta BrightPOS (lime), tipografía (Inter/Poppins), tokens, Button (primary/outline/ghost), Input, Form field, Card, App shell (top bar + sidebar agrupado), Sidebar nav item, Section header. **+M8:** Select field, Date input, Alert/Callout banner, Status badge (OK/atención/neutro), Sidebar section group, Tabla de historial.
 - Próximas extensiones (otros módulos): chips de categoría (estilo tabs lime), stepper de cantidad ("− n +" con + lime), grid de cards de producto, breadcrumb.

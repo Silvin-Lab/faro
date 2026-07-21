@@ -14,6 +14,7 @@ Sistematizar los procesos clave de una cafetería (productos, ventas, reportes, 
 | M5 | sales-reports         | Reportes diarios y por periodo, agrupados por categoría y horario           | 👁 review ✅ (pre-deploy) | 5 | M4 |
 | M6 | loyalty               | Alta por teléfono, puntos, tarjeta QR wallet iOS/Android, WhatsApp, redención| 🔨 entrada iniciada (clientes ✅) | 6 | M3, M4 |
 | M7 | business-settings     | Negocio único: super admin administra sucursales (M:N), usuarios y favicon; sucursal activa de sesión etiqueta ventas | 🎨 diseño listo (docs; ADR-006/007) | 7 | M1, M4, M5 |
+| M8 | warehouse             | Almacén central (único) con mín/máx y alerta de reposición; Compras (+ catálogo de proveedores), Salidas a sucursal, Mermas; reorg de navegación desde /supplies/[id]/edit | 🔍 discovery (brief) | 8 | supplies, business-settings |
 
 _Estados: 💡 idea · 📋 backlog · 🔍 discovery · 🎨 design · 🟢 ready · 🔨 in-dev · 🧪 qa · 👁 review · 🚀 deployed · ✅ done_
 
@@ -30,3 +31,4 @@ _Estados: 💡 idea · 📋 backlog · 🔍 discovery · 🎨 design · 🟢 rea
 - Documento **vivo**: se agregan/reordenan módulos sin tocar los terminados ni el charter.
 - v1 sin roles; "roles y permisos" entrará como módulo futuro.
 - "Inventario" se menciona en el objetivo: pendiente decidir si entra como módulo propio tras el MVP.
+- **Roadmap desactualizado:** hay módulos ya construidos y en prod que esta tabla aún no refleja (expenses, supplies con categorías/medidas de uso, roles, branches). La numeración "M8" de `warehouse` es el siguiente número libre en esta tabla; puede no coincidir con la numeración conceptual de los módulos no reflejados (p.ej. "roles"). Pendiente reconciliar el historial en una pasada futura.

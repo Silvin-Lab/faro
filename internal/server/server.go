@@ -22,12 +22,13 @@ import (
 	"faro/internal/settings"
 	"faro/internal/supplies"
 	"faro/internal/uploads"
+	"faro/internal/warehouse"
 )
 
 // New construye el handler HTTP raíz. Los módulos (auth, products, …) montarán
 // aquí sus sub-routers en incrementos siguientes. corsOrigin es el origen del
 // frontend (faro-ui) autorizado a consumir la API con credenciales.
-func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
+func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
@@ -84,6 +85,9 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 	// Insumos: catálogo/existencias/recetas. Lectura por sesión; escritura (catálogo,
 	// movimientos de inventario y recetas) solo super admin. Inventario por sucursal.
 	r.Mount("/supplies", suppliesSvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
+	// Almacén central (M8): existencias/mín-máx, proveedores, compras, salidas y
+	// mermas. TODO el módulo (lectura y escritura) está gated a super admin.
+	r.Mount("/warehouse", warehouseSvc.Routes(authSvc.RequireSuperAdmin))
 	// Subida de imágenes (POST, solo super admin) y servir archivos estáticos (público).
 	r.Mount("/uploads", uploadsH.Routes())
 	r.Handle("/files/*", http.StripPrefix("/files/", http.FileServer(http.Dir(uploadDir))))

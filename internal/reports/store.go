@@ -39,6 +39,7 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 		ByCategory:      []CategoryBreakdown{},
 		ByHour:          []HourBreakdown{},
 		ByBranch:        []BranchBreakdown{},
+		ByProduct:       []ProductBreakdown{},
 	}
 
 	// Resumen.
@@ -99,6 +100,37 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 	}
 	catRows.Close()
 	if err := catRows.Err(); err != nil {
+		return SalesReport{}, err
+	}
+
+	// Por producto dentro de su categoría (resumen final del reporte: qué se
+	// vendió y cuánto de cada uno). Ordenado por categoría y luego por total
+	// vendido descendente, así el frontend agrupa por CategoryName sin reordenar.
+	prodCond, prodArgs := branchClause("s.", 4, branch)
+	prodRows, err := s.pool.Query(ctx,
+		`SELECT COALESCE(c.name, 'Sin categoría'), COALESCE(p.name, 'Producto eliminado'),
+		        COALESCE(SUM(si.quantity), 0), COALESCE(SUM(si.line_total_cents), 0)
+		   FROM sale_items si
+		   JOIN sales s ON s.id = si.sale_id
+		   LEFT JOIN products p ON p.id = si.product_id
+		   LEFT JOIN categories c ON c.id = p.category_id
+		  WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $3`+prodCond+`
+		  GROUP BY COALESCE(c.name, 'Sin categoría'), COALESCE(p.name, 'Producto eliminado')
+		  ORDER BY COALESCE(c.name, 'Sin categoría'), SUM(si.line_total_cents) DESC`,
+		append([]any{tenantID, from, to}, prodArgs...)...)
+	if err != nil {
+		return SalesReport{}, err
+	}
+	for prodRows.Next() {
+		var b ProductBreakdown
+		if err := prodRows.Scan(&b.CategoryName, &b.ProductName, &b.Quantity, &b.TotalCents); err != nil {
+			prodRows.Close()
+			return SalesReport{}, err
+		}
+		rep.ByProduct = append(rep.ByProduct, b)
+	}
+	prodRows.Close()
+	if err := prodRows.Err(); err != nil {
 		return SalesReport{}, err
 	}
 

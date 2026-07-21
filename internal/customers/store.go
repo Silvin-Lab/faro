@@ -23,13 +23,15 @@ func newStore(pool *pgxpool.Pool) *store {
 	return &store{pool: pool}
 }
 
-func (s *store) create(ctx context.Context, tenantID, phone, firstName, lastName string) (Customer, error) {
+// create inserta el cliente con sus visitas iniciales (0 si no traía ninguna).
+// visits y visits_lifetime arrancan iguales: de por vida nunca es menor al ciclo.
+func (s *store) create(ctx context.Context, tenantID, phone, firstName, lastName string, priorVisits int) (Customer, error) {
 	var c Customer
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO customers (tenant_id, phone, first_name, last_name)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO customers (tenant_id, phone, first_name, last_name, visits, visits_lifetime)
+		 VALUES ($1, $2, $3, $4, $5, $5)
 		 RETURNING id::text, tenant_id::text, phone, first_name, last_name, visits, visits_lifetime, created_at`,
-		tenantID, phone, firstName, lastName).
+		tenantID, phone, firstName, lastName, priorVisits).
 		Scan(&c.ID, &c.TenantID, &c.Phone, &c.FirstName, &c.LastName, &c.Visits, &c.VisitsLifetime, &c.CreatedAt)
 	if dberr.IsUniqueViolation(err) {
 		return Customer{}, ErrPhoneTaken
@@ -65,6 +67,30 @@ func (s *store) setVisits(ctx context.Context, tenantID, id string, visits int) 
 		return Customer{}, ErrNotFound
 	}
 	return c, err
+}
+
+// listAll devuelve clientes del negocio ordenados por nombre, paginados con
+// limit/offset (listado por default de la pantalla Clientes, "mostrar más").
+func (s *store) listAll(ctx context.Context, tenantID string, limit, offset int) ([]Customer, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, tenant_id::text, phone, first_name, last_name, visits, visits_lifetime, created_at
+		   FROM customers
+		  WHERE tenant_id = $1
+		  ORDER BY first_name, last_name
+		  LIMIT $2 OFFSET $3`, tenantID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Customer{}
+	for rows.Next() {
+		var c Customer
+		if err := rows.Scan(&c.ID, &c.TenantID, &c.Phone, &c.FirstName, &c.LastName, &c.Visits, &c.VisitsLifetime, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // searchByQuery busca clientes por nombre (first/last) o teléfono con ILIKE

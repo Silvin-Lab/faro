@@ -26,6 +26,7 @@ import (
 	"faro/internal/settings"
 	"faro/internal/supplies"
 	"faro/internal/uploads"
+	"faro/internal/warehouse"
 )
 
 type m7Env struct {
@@ -51,7 +52,7 @@ func setupM7(t *testing.T) *m7Env {
 		t.Skipf("DB de test no disponible: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		"TRUNCATE user_branches, loyalty_redemptions, loyalty_promotion_products, loyalty_promotions, sale_items, sales, customers, products, categories, branches, users, tenants RESTART IDENTITY CASCADE"); err != nil {
+		"TRUNCATE warehouse_movements, warehouse_stock, suppliers, supply_movements, supply_branch_stock, product_supplies, supply_measures, supplies, supply_categories, user_branches, loyalty_redemptions, loyalty_promotion_products, loyalty_promotions, sale_items, sales, customers, products, categories, branches, users, tenants RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -65,7 +66,7 @@ func setupM7(t *testing.T) *m7Env {
 		categories.NewService(pool), products.NewService(pool), sales.NewService(pool),
 		customers.NewService(pool), reports.NewService(pool), loyalty.NewService(pool),
 		branches.NewService(pool), settings.NewService(pool), expenses.NewService(pool),
-		supplies.NewService(pool), uploadsH, dir)
+		supplies.NewService(pool), warehouse.NewService(pool), uploadsH, dir)
 
 	env := &m7Env{srv: httptest.NewServer(handler), pool: pool}
 
