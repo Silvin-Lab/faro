@@ -110,9 +110,11 @@ func sessionCookieFrom(resp *http.Response) *http.Cookie {
 	return nil
 }
 
-// TestSessionTTLByRole verifica que la expiración de la cookie de sesión (y por ende
-// del JWT) depende del rol: 7 días para super_admin/branch_admin, 20h para cashier.
-func TestSessionTTLByRole(t *testing.T) {
+// TestSessionExpiryUniformAcrossRoles verifica que la sesión expira a la próxima
+// 8:00am America/Mexico_City sin importar el rol (fix del incidente 2026-07-10:
+// antes el TTL era fijo por rol -20h cashier, 7 días admin- y una sesión de staff
+// podía vencer a media jornada sin aviso). Ver ttl.go/nextSessionExpiry.
+func TestSessionExpiryUniformAcrossRoles(t *testing.T) {
 	svc, pool := testService(t)
 	defer pool.Close()
 	ctx := context.Background()
@@ -138,7 +140,7 @@ func TestSessionTTLByRole(t *testing.T) {
 	defer srv.Close()
 	client := srv.Client()
 
-	assertTTL := func(email, pass string, want time.Duration) {
+	assertExpiresAtNext8am := func(email, pass string) {
 		t.Helper()
 		before := time.Now()
 		resp := postJSON(t, client, srv.URL+"/login", map[string]string{"email": email, "password": pass})
@@ -149,14 +151,14 @@ func TestSessionTTLByRole(t *testing.T) {
 		if c == nil {
 			t.Fatalf("login %s: sin cookie de sesión", email)
 		}
-		got := c.Expires.Sub(before)
-		if d := got - want; d < -2*time.Minute || d > 2*time.Minute {
-			t.Fatalf("TTL de %s = %v, esperaba ≈ %v", email, got, want)
+		want := nextSessionExpiry(before)
+		if d := c.Expires.Sub(want); d < -2*time.Minute || d > 2*time.Minute {
+			t.Fatalf("expiración de %s = %v, esperaba ≈ %v (próxima 8am CDMX)", email, c.Expires, want)
 		}
 	}
 
-	assertTTL("root@faro.test", "secret123", 7*24*time.Hour)  // super_admin
-	assertTTL("cajero@vanta.test", "secret123", 20*time.Hour) // cashier
+	assertExpiresAtNext8am("root@faro.test", "secret123")    // super_admin
+	assertExpiresAtNext8am("cajero@vanta.test", "secret123") // cashier: mismo criterio, sin importar el rol
 }
 
 func TestLoginInvalidCredentials(t *testing.T) {
