@@ -16,7 +16,7 @@ type CategoryBreakdown struct {
 
 // ProductBreakdown agrega ventas por producto dentro de su categoría (resumen al
 // final del reporte: qué productos y cuántos de cada uno se vendieron). Viene
-// ordenado por categoría y luego por total vendido descendente; el frontend lo
+// ordenado por categoría y luego por cantidad vendida descendente; el frontend lo
 // agrupa por CategoryName para el desglose.
 type ProductBreakdown struct {
 	CategoryName string `json:"categoryName"`

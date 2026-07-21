@@ -104,8 +104,8 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 	}
 
 	// Por producto dentro de su categoría (resumen final del reporte: qué se
-	// vendió y cuánto de cada uno). Ordenado por categoría y luego por total
-	// vendido descendente, así el frontend agrupa por CategoryName sin reordenar.
+	// vendió y cuánto de cada uno). Ordenado por categoría y luego por cantidad
+	// vendida descendente, así el frontend agrupa por CategoryName sin reordenar.
 	prodCond, prodArgs := branchClause("s.", 4, branch)
 	prodRows, err := s.pool.Query(ctx,
 		`SELECT COALESCE(c.name, 'Sin categoría'), COALESCE(p.name, 'Producto eliminado'),
@@ -116,7 +116,7 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 		   LEFT JOIN categories c ON c.id = p.category_id
 		  WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $3`+prodCond+`
 		  GROUP BY COALESCE(c.name, 'Sin categoría'), COALESCE(p.name, 'Producto eliminado')
-		  ORDER BY COALESCE(c.name, 'Sin categoría'), SUM(si.line_total_cents) DESC`,
+		  ORDER BY COALESCE(c.name, 'Sin categoría'), SUM(si.quantity) DESC`,
 		append([]any{tenantID, from, to}, prodArgs...)...)
 	if err != nil {
 		return SalesReport{}, err
