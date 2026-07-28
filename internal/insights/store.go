@@ -137,6 +137,23 @@ const productSalesCTE = `
 	  GROUP BY si.product_id, COALESCE(p.name, si.name, 'Producto eliminado')
 	)`
 
+// categorySalesCTE es la base de ventas por categoría (ingresos + volumen). Une
+// sale_items → products → categories con LEFT JOIN, igual que reports.salesReport:
+// "Sin categoría" (COALESCE) agrupa productos vivos sin categoría y productos
+// borrados (addendum §1.2). El filtro [branch] usa alias "s." en $4.
+const categorySalesCTE = `
+	WITH category_sales AS (
+	  SELECT COALESCE(c.name, 'Sin categoría') AS name,
+	         SUM(si.line_total_cents)          AS revenue_cents,
+	         SUM(si.quantity)                  AS units
+	  FROM sale_items si
+	  JOIN sales s ON s.id = si.sale_id
+	  LEFT JOIN products p ON p.id = si.product_id
+	  LEFT JOIN categories c ON c.id = p.category_id
+	  WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $3%s
+	  GROUP BY COALESCE(c.name, 'Sin categoría')
+	)`
+
 // recipeCostCTE calcula el costo de insumos por unidad vendida del producto. Usa
 // bool_or(package_cost_cents IS NULL) para detectar costo faltante: SUM() ignora
 // los NULL, así que confiar en la suma subestimaría el costo (tech-spec T4/F7).
@@ -158,6 +175,8 @@ func (s *store) topProducts(ctx context.Context, sc Scope) (TopProductsInsight, 
 		ByVolume:           []ProductRevenue{},
 		ByMargin:           []ProductMargin{},
 		ExcludedFromMargin: []ExcludedProduct{},
+		ByCategoryRevenue:  []CategoryRevenue{},
+		ByCategoryVolume:   []CategoryRevenue{},
 	}
 	bc, bArgs := branchClause("s.", 4, sc.Branch)
 	args := append([]any{sc.TenantID, sc.From, sc.To}, bArgs...)
@@ -253,7 +272,53 @@ func (s *store) topProducts(ctx context.Context, sc Scope) (TopProductsInsight, 
 		out.ExcludedFromMargin = append(out.ExcludedFromMargin, e)
 	}
 	exclRows.Close()
-	return out, exclRows.Err()
+	if err := exclRows.Err(); err != nil {
+		return TopProductsInsight{}, err
+	}
+
+	// Rankings por categoría (ingresos y volumen). Misma base category_sales, dos
+	// ordenamientos, reusando los mismos args (tenant, from, to (+branch)). Addendum §1.
+	catBase := fmt.Sprintf(categorySalesCTE, bc)
+
+	catRevRows, err := s.pool.Query(ctx, catBase+`
+		SELECT name, revenue_cents, units FROM category_sales
+		ORDER BY revenue_cents DESC LIMIT 5`, args...)
+	if err != nil {
+		return TopProductsInsight{}, err
+	}
+	for catRevRows.Next() {
+		var c CategoryRevenue
+		if err := catRevRows.Scan(&c.Name, &c.RevenueCents, &c.Units); err != nil {
+			catRevRows.Close()
+			return TopProductsInsight{}, err
+		}
+		out.ByCategoryRevenue = append(out.ByCategoryRevenue, c)
+	}
+	catRevRows.Close()
+	if err := catRevRows.Err(); err != nil {
+		return TopProductsInsight{}, err
+	}
+
+	catVolRows, err := s.pool.Query(ctx, catBase+`
+		SELECT name, revenue_cents, units FROM category_sales
+		ORDER BY units DESC LIMIT 5`, args...)
+	if err != nil {
+		return TopProductsInsight{}, err
+	}
+	for catVolRows.Next() {
+		var c CategoryRevenue
+		if err := catVolRows.Scan(&c.Name, &c.RevenueCents, &c.Units); err != nil {
+			catVolRows.Close()
+			return TopProductsInsight{}, err
+		}
+		out.ByCategoryVolume = append(out.ByCategoryVolume, c)
+	}
+	catVolRows.Close()
+	if err := catVolRows.Err(); err != nil {
+		return TopProductsInsight{}, err
+	}
+
+	return out, nil
 }
 
 // ---- Insight 3: Ticket por segmento (§5.3) --------------------------------
@@ -406,7 +471,7 @@ func (s *store) secondVisit(ctx context.Context, sc Scope, sampleMin, supportMin
 // ---- Insight 5: Afinidad de canasta (§5.5) --------------------------------
 
 func (s *store) basketAffinity(ctx context.Context, sc Scope, supportMin int) (BasketAffinityInsight, error) {
-	out := BasketAffinityInsight{Items: []BasketPair{}}
+	out := BasketAffinityInsight{Items: []BasketPair{}, CategoryItems: []CategoryPair{}}
 
 	// El soporte mínimo (HAVING) va tras el arg de sucursal (si lo hay).
 	bc, bArgs := branchClause("s.", 4, sc.Branch)
@@ -457,6 +522,62 @@ func (s *store) basketAffinity(ctx context.Context, sc Scope, supportMin int) (B
 		return BasketAffinityInsight{}, err
 	}
 	out.Insufficient = len(out.Items) == 0
+
+	// Afinidad por categoría (addendum §2). Mismo método (soporte + lift) sobre las
+	// categorías DISTINTAS de cada venta: dos productos de la misma categoría colapsan
+	// a un solo nodo (DISTINCT), así que el self-join a.cat_key < b.cat_key nunca los
+	// empareja consigo mismos (§2.1). Clave por c.id::text ('none' = "Sin categoría",
+	// bucket que participa como nodo, §2.3). Reusa defaultAffinitySupportMin en $supIdx.
+	bc2, bArgs2 := branchClause("s.", 4, sc.Branch)
+	supIdx2 := 4 + len(bArgs2)
+	args2 := append([]any{sc.TenantID, sc.From, sc.To}, bArgs2...)
+	args2 = append(args2, supportMin)
+	catRows, err := s.pool.Query(ctx, `
+		WITH sale_categories AS (
+		  SELECT DISTINCT si.sale_id,
+		         COALESCE(c.id::text, 'none')      AS cat_key,
+		         COALESCE(c.name, 'Sin categoría') AS cat_name
+		  FROM sale_items si
+		  JOIN sales s ON s.id = si.sale_id
+		  LEFT JOIN products p ON p.id = si.product_id
+		  LEFT JOIN categories c ON c.id = p.category_id
+		  WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $3`+bc2+`
+		),
+		pairs AS (
+		  SELECT a.cat_key AS ka, a.cat_name AS na, b.cat_key AS kb, b.cat_name AS nb,
+		         COUNT(*) AS support
+		  FROM sale_categories a
+		  JOIN sale_categories b
+		    ON a.sale_id = b.sale_id
+		   AND a.cat_key < b.cat_key
+		  GROUP BY a.cat_key, a.cat_name, b.cat_key, b.cat_name
+		  HAVING COUNT(*) >= $`+fmt.Sprint(supIdx2)+`
+		),
+		freq AS (SELECT cat_key, COUNT(*) AS cnt FROM sale_categories GROUP BY cat_key),
+		tot  AS (SELECT COUNT(DISTINCT sale_id) AS n FROM sale_categories)
+		SELECT pairs.na, pairs.nb, pairs.support,
+		       (pairs.support::numeric * tot.n) / (fa.cnt * fb.cnt) AS lift
+		FROM pairs
+		JOIN freq fa ON fa.cat_key = pairs.ka
+		JOIN freq fb ON fb.cat_key = pairs.kb
+		CROSS JOIN tot
+		ORDER BY pairs.support DESC, lift DESC
+		LIMIT 10`, args2...)
+	if err != nil {
+		return BasketAffinityInsight{}, err
+	}
+	defer catRows.Close()
+	for catRows.Next() {
+		var p CategoryPair
+		if err := catRows.Scan(&p.A, &p.B, &p.Support, &p.Lift); err != nil {
+			return BasketAffinityInsight{}, err
+		}
+		out.CategoryItems = append(out.CategoryItems, p)
+	}
+	if err := catRows.Err(); err != nil {
+		return BasketAffinityInsight{}, err
+	}
+	out.CategoryInsufficient = len(out.CategoryItems) == 0
 	return out, nil
 }
 

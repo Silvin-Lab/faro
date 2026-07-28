@@ -90,12 +90,25 @@ type ExcludedProduct struct {
 	Reason string `json:"reason"`
 }
 
-// TopProductsInsight es la respuesta de /insights/top-products.
+// CategoryRevenue es una fila de los rankings por categoría (ingresos y volumen).
+// name = nombre de categoría o "Sin categoría" (bucket que agrupa productos sin
+// categoría y productos borrados; ver addendum §1.2).
+type CategoryRevenue struct {
+	Name         string `json:"name"`
+	RevenueCents int    `json:"revenueCents"`
+	Units        int    `json:"units"`
+}
+
+// TopProductsInsight es la respuesta de /insights/top-products. Los rankings por
+// categoría (byCategory*) son aditivos al contrato original (addendum §1/§3.1);
+// margen por categoría queda fuera de v1 (addendum §0).
 type TopProductsInsight struct {
 	ByRevenue          []ProductRevenue  `json:"byRevenue"`
 	ByVolume           []ProductRevenue  `json:"byVolume"`
 	ByMargin           []ProductMargin   `json:"byMargin"`
 	ExcludedFromMargin []ExcludedProduct `json:"excludedFromMargin"`
+	ByCategoryRevenue  []CategoryRevenue `json:"byCategoryRevenue"`
+	ByCategoryVolume   []CategoryRevenue `json:"byCategoryVolume"`
 }
 
 // ---- Insight 3: Ticket por segmento (§5.3) --------------------------------
@@ -147,11 +160,25 @@ type BasketPair struct {
 	Lift    float64 `json:"lift"`
 }
 
+// CategoryPair es un par de categorías co-compradas en la misma venta. Support =
+// nº de ventas que contienen AMBAS categorías (distintas); Lift = (support × N) /
+// (freq_A × freq_B). No incluye pares categoría-consigo-misma (addendum §2.1).
+type CategoryPair struct {
+	A       string  `json:"a"`
+	B       string  `json:"b"`
+	Support int     `json:"support"`
+	Lift    float64 `json:"lift"`
+}
+
 // BasketAffinityInsight es la respuesta de /insights/basket-affinity.
 // Insufficient=true (lista vacía) cuando no hay pares que alcancen el soporte.
+// CategoryItems/CategoryInsufficient son la vista aditiva por categoría (addendum
+// §2/§3.2); CategoryInsufficient es INDEPENDIENTE de Insufficient.
 type BasketAffinityInsight struct {
-	Insufficient bool         `json:"insufficient"`
-	Items        []BasketPair `json:"items"`
+	Insufficient         bool           `json:"insufficient"`
+	Items                []BasketPair   `json:"items"`
+	CategoryItems        []CategoryPair `json:"categoryItems"`
+	CategoryInsufficient bool           `json:"categoryInsufficient"`
 }
 
 // ---- Insight 6: Efectividad de lealtad (§5.6) -----------------------------
