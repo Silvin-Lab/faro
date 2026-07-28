@@ -18,6 +18,7 @@ import (
 	"faro/internal/categories"
 	"faro/internal/customers"
 	"faro/internal/expenses"
+	"faro/internal/insights"
 	"faro/internal/loyalty"
 	"faro/internal/products"
 	"faro/internal/reports"
@@ -64,7 +65,7 @@ func setupM7(t *testing.T) *m7Env {
 	uploadsH := uploads.New(dir, authSvc.RequireSuperAdmin)
 	handler := server.New(pool, "http://localhost:3000", authSvc,
 		categories.NewService(pool), products.NewService(pool), sales.NewService(pool),
-		customers.NewService(pool), reports.NewService(pool), loyalty.NewService(pool),
+		customers.NewService(pool), reports.NewService(pool), insights.NewService(pool), loyalty.NewService(pool),
 		branches.NewService(pool), settings.NewService(pool), expenses.NewService(pool),
 		supplies.NewService(pool), warehouse.NewService(pool), uploadsH, dir)
 

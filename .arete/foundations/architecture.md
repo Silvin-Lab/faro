@@ -79,6 +79,20 @@ faro/  (backend)                     faro-ui/  (frontend)
   venta (`deductSupplies`, que resta). Detalle en ADR-008 y `modules/warehouse/tech-spec.md`.
 - **Módulo** `internal/warehouse` montado en `/warehouse`, gated a **super_admin**.
 
+## Insights de negocio (M9 — ver ADR-009)
+- **Módulo `internal/insights`** montado en `/insights`, **solo lectura**, mismo patrón
+  store/service que `internal/reports`. Gating idéntico a reports: super_admin (branchId libre)
+  + branch_admin (acotado a su sucursal); cashier/barista → 403.
+- **Determinístico, sin IA:** 6 insights (recurrencia, producto estrella, ticket por segmento,
+  2ª visita, afinidad de canasta, efectividad de lealtad) calculados con SQL/Go. **Ninguna ruta
+  llama a un LLM** (decisión de negocio cerrada).
+- **Cálculo en vivo, sin cache/precómputo** (ADR-009): a volumen single-tenant es lo más simple
+  y lo más barato en Neon (CU-hora). Señal de revisión documentada en la tech-spec.
+- **Sin esquema nuevo:** agrega sobre `sales`, `sale_items`, `products`, `product_supplies`,
+  `supplies`, `loyalty_redemptions`. El canje de lealtad se lee de **`loyalty_redemptions`**
+  (la columna `sales.loyalty_reward` fue eliminada en 0010; ver ADR-009). Detalle en
+  `modules/insights/tech-spec.md`.
+
 ## Límites y contratos
 - **Web ↔ API:** REST/JSON. La cookie de sesión viaja en cada request (no hay tokens en localStorage).
 - **API ↔ DB:** acceso solo desde la API; el frontend nunca habla con la DB.

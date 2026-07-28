@@ -15,6 +15,7 @@ import (
 	"faro/internal/categories"
 	"faro/internal/customers"
 	"faro/internal/expenses"
+	"faro/internal/insights"
 	"faro/internal/loyalty"
 	"faro/internal/products"
 	"faro/internal/reports"
@@ -28,7 +29,7 @@ import (
 // New construye el handler HTTP raíz. Los módulos (auth, products, …) montarán
 // aquí sus sub-routers en incrementos siguientes. corsOrigin es el origen del
 // frontend (faro-ui) autorizado a consumir la API con credenciales.
-func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
+func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, insightsSvc *insights.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
@@ -49,7 +50,9 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	// Readiness: además la base de datos responde.
+	// Readiness: además la base de datos responde. NO lo pollea el health check de
+	// Fly (eso mantenía a Neon despierto 24/7); queda para diagnóstico manual, por
+	// eso el ping es en vivo y sin caché: en debug querés el estado real de la DB.
 	r.Get("/ready", func(w http.ResponseWriter, req *http.Request) {
 		if err := pool.Ping(req.Context()); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "db_unavailable"})
@@ -73,6 +76,10 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 	// Reportes (M5/M8): agregados de ventas por rango. Autorización por rol dentro
 	// del handler: super admin (todas), branch_admin (su sucursal), resto 403.
 	r.Mount("/reports", reportsSvc.Routes(authSvc.RequireSession))
+	// Insights (M9): métricas de comportamiento (solo lectura, sin IA). Autorización
+	// por rol dentro del handler: super admin (todas), branch_admin (su sucursal),
+	// cashier/barista 403.
+	r.Mount("/insights", insightsSvc.Routes(authSvc.RequireSession))
 	// Lealtad (M6 v2): lectura por sesión, CRUD de promociones solo super admin.
 	r.Mount("/loyalty", loyaltySvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
 	// Sucursales (M7): CRUD solo super admin.

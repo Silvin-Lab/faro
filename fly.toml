@@ -22,12 +22,18 @@ primary_region = "iad"  # cerca de Neon us-east-1
   auto_start_machines = true
   min_machines_running = 1
 
+  # Check de liveness: ¿el proceso vive y acepta tráfico? Apunta a /health, que
+  # NO toca la DB. Con una sola máquina (min_machines_running=1, sin réplica a la
+  # que enrutar) el check solo decide "vivo/muerto", no readiness de dependencias.
+  # Usar /ready aquí forzaba un pool.Ping a Neon cada 15s, manteniéndolo despierto
+  # 24/7 y quemando cuota de cómputo. Para readiness real (DB alcanzable) se usa
+  # /ready manualmente en diagnóstico.
   [[http_service.checks]]
     interval = "15s"
     timeout = "3s"
     grace_period = "20s"
     method = "get"
-    path = "/ready"
+    path = "/health"
 
 [[vm]]
   size = "shared-cpu-1x"

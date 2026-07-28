@@ -18,6 +18,7 @@ import (
 	"faro/internal/customers"
 	"faro/internal/db"
 	"faro/internal/expenses"
+	"faro/internal/insights"
 	"faro/internal/loyalty"
 	"faro/internal/products"
 	"faro/internal/reports"
@@ -61,6 +62,7 @@ func main() {
 	salesSvc := sales.NewService(pool)
 	custSvc := customers.NewService(pool)
 	reportsSvc := reports.NewService(pool)
+	insightsSvc := insights.NewService(pool)
 	loyaltySvc := loyalty.NewService(pool)
 	branchesSvc := branches.NewService(pool)
 	settingsSvc := settings.NewService(pool)
@@ -75,7 +77,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           server.New(pool, cfg.CORSOrigin, authSvc, catSvc, prodSvc, salesSvc, custSvc, reportsSvc, loyaltySvc, branchesSvc, settingsSvc, expensesSvc, suppliesSvc, warehouseSvc, uploadsH, cfg.UploadDir),
+		Handler:           server.New(pool, cfg.CORSOrigin, authSvc, catSvc, prodSvc, salesSvc, custSvc, reportsSvc, insightsSvc, loyaltySvc, branchesSvc, settingsSvc, expensesSvc, suppliesSvc, warehouseSvc, uploadsH, cfg.UploadDir),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

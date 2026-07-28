@@ -15,6 +15,7 @@ Sistematizar los procesos clave de una cafetería (productos, ventas, reportes, 
 | M6 | loyalty               | Alta por teléfono, puntos, tarjeta QR wallet iOS/Android, WhatsApp, redención| 🔨 entrada iniciada (clientes ✅) | 6 | M3, M4 |
 | M7 | business-settings     | Negocio único: super admin administra sucursales (M:N), usuarios y favicon; sucursal activa de sesión etiqueta ventas | 🎨 diseño listo (docs; ADR-006/007) | 7 | M1, M4, M5 |
 | M8 | warehouse             | Almacén central (único) con mín/máx y alerta de reposición; Compras (+ catálogo de proveedores), Salidas a sucursal, Mermas; reorg de navegación desde /supplies/[id]/edit | 🔍 discovery (brief) | 8 | supplies, business-settings |
+| M9 | insights              | Inteligencia de negocio (sin LLM): recurrencia de clientes, producto estrella (ingresos/volumen/margen), ticket nuevo vs. recurrente, correlación visita-N↔producto, afinidad de canasta, efectividad de lealtad | 👁 review ✅ approve, demo local lista, pendiente validación Silvin | 9 | sales-reports, loyalty, supplies |
 
 _Estados: 💡 idea · 📋 backlog · 🔍 discovery · 🎨 design · 🟢 ready · 🔨 in-dev · 🧪 qa · 👁 review · 🚀 deployed · ✅ done_
 
