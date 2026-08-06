@@ -18,9 +18,10 @@ func (svc *Service) Routes(requireSuperAdmin func(http.Handler) http.Handler) ht
 	r := chi.NewRouter()
 	r.Use(requireSuperAdmin)
 
-	// Existencias + mín/máx + a-comprar.
+	// Existencias + mín/máx + ajuste manual + a-comprar.
 	r.Get("/stock", svc.handleListStock)
 	r.Patch("/stock/{supplyId}", svc.handleUpdateMinMax)
+	r.Post("/stock/{supplyId}/adjust", svc.handleAdjustStock)
 	r.Get("/to-buy", svc.handleToBuy)
 
 	// Proveedores.
@@ -142,15 +143,24 @@ func (svc *Service) handleListStock(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := svc.ListStock(r.Context(), tenantID)
-	if err != nil {
+	// status opcional: ?status=active para el select de "nuevo insumo para compra"
+	// (excluye los dados de baja); ausente = todos (incluye inactivos con stock).
+	var status *string
+	if s := r.URL.Query().Get("status"); s != "" {
+		status = &s
+	}
+	items, err := svc.ListStock(r.Context(), tenantID, status)
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "status inválido")
+	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar las existencias")
-		return
+	default:
+		if items == nil {
+			items = []WarehouseStockItem{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	}
-	if items == nil {
-		items = []WarehouseStockItem{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (svc *Service) handleUpdateMinMax(w http.ResponseWriter, r *http.Request) {
@@ -194,6 +204,46 @@ func (svc *Service) handleUpdateMinMax(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron guardar los límites")
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"item": it})
+	}
+}
+
+// adjustRequest es el cuerpo del ajuste manual: newQuantity es la NUEVA existencia
+// total deseada (no un delta), en unidad base. date opcional (backdating).
+type adjustRequest struct {
+	NewQuantity int    `json:"newQuantity"`
+	Date        string `json:"date"`
+}
+
+// handleAdjustStock fija la existencia del almacén de un insumo al total deseado
+// (POST /warehouse/stock/{supplyId}/adjust). Registra un movimiento 'adjustment' con
+// la diferencia firmada; si el valor no cambia es un no-op (movement: null). 200 OK.
+func (svc *Service) handleAdjustStock(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
+	var req adjustRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
+		return
+	}
+	m, stockBase, err := svc.AdjustStock(r.Context(), tenantID, chi.URLParam(r, "supplyId"), AdjustInput{
+		NewQuantity: req.NewQuantity, Date: req.Date,
+	}, u.ID)
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "La cantidad no puede ser negativa")
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Insumo no encontrado")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo ajustar la existencia")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"movement": m, "stockBase": stockBase})
 	}
 }
 

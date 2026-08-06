@@ -39,6 +39,7 @@ func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) 
 		r.Patch("/measures/{measureId}", svc.handleUpdateMeasure)
 		r.Delete("/measures/{measureId}", svc.handleDeleteMeasure)
 		r.Patch("/{id}", svc.handleUpdate)
+		r.Delete("/{id}", svc.handleDelete)
 		r.Post("/{id}/movements", svc.handleCreateMovement)
 		r.Get("/{id}/movements", svc.handleListMovements)
 		r.Put("/recipes/{productId}", svc.handleReplaceRecipe)
@@ -165,15 +166,24 @@ func (svc *Service) handleList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := svc.List(r.Context(), tenantID)
-	if err != nil {
+	// status opcional: ?status=active para los selects de "nuevo insumo" (excluye los
+	// dados de baja); ausente = todos (catálogo completo, incluye inactivos).
+	var status *string
+	if s := r.URL.Query().Get("status"); s != "" {
+		status = &s
+	}
+	items, err := svc.List(r.Context(), tenantID, status)
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "status inválido")
+	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar los insumos")
-		return
+	default:
+		if items == nil {
+			items = []Supply{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	}
-	if items == nil {
-		items = []Supply{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (svc *Service) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +240,25 @@ func (svc *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo actualizar el insumo")
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"supply": sp})
+	}
+}
+
+// handleDelete da de baja un insumo (soft-delete: DELETE /supplies/{id} => status
+// 'inactive'). No borra datos: el insumo se conserva en historiales y recetas
+// existentes, solo deja de ofrecerse en los selects activos. 204 No Content.
+func (svc *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	err := svc.SoftDelete(r.Context(), tenantID, chi.URLParam(r, "id"))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Insumo no encontrado")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo eliminar el insumo")
+	default:
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

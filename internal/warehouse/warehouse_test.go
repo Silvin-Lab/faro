@@ -173,7 +173,7 @@ func TestMinMaxAndStatusAndToBuy(t *testing.T) {
 	ctx := context.Background()
 
 	// Sin fila: status no_min, stock 0.
-	list, err := f.svc.ListStock(ctx, f.tenantA)
+	list, err := f.svc.ListStock(ctx, f.tenantA, nil)
 	if err != nil {
 		t.Fatalf("listStock: %v", err)
 	}
@@ -479,6 +479,108 @@ func TestDispatchConcurrency(t *testing.T) {
 	}
 	if f.warehouseStock(t, f.supplyA) != f.sumWarehouseMovements(t, f.supplyA) {
 		t.Fatalf("invariante almacén rota tras concurrencia")
+	}
+}
+
+// countWarehouseMovements cuenta las filas del ledger del almacén para un supply.
+func (f *fixture) countWarehouseMovements(t *testing.T, supplyID string) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM warehouse_movements WHERE supply_id=$1`, supplyID).Scan(&n); err != nil {
+		t.Fatalf("countWarehouseMovements: %v", err)
+	}
+	return n
+}
+
+// TestAdjustStock cubre el ajuste manual de existencia del almacén: incremento desde
+// stock 0 (fila lazy), decremento, no-op (mismo valor => sin movimiento), validación
+// de cantidad negativa, insumo ajeno/inexistente y el invariante
+// stock_base == SUM(quantity_base) tras mezclarse con una compra.
+func TestAdjustStock(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	// Incremento desde 0 (fila lazy inexistente): fija a 500.
+	m, stock, err := f.svc.AdjustStock(ctx, f.tenantA, f.supplyA, AdjustInput{NewQuantity: 500}, f.userA)
+	if err != nil {
+		t.Fatalf("ajuste incremento: %v", err)
+	}
+	if m == nil || m.Type != "adjustment" || m.QuantityBase != 500 {
+		t.Fatalf("movimiento incremento inesperado: %+v", m)
+	}
+	if stock != 500 {
+		t.Fatalf("stock incremento: esperaba 500, obtuvo %d", stock)
+	}
+	if f.warehouseStock(t, f.supplyA) != f.sumWarehouseMovements(t, f.supplyA) {
+		t.Fatalf("invariante rota tras incremento")
+	}
+
+	// Decremento: de 500 a 200 => movimiento -300.
+	m, stock, err = f.svc.AdjustStock(ctx, f.tenantA, f.supplyA, AdjustInput{NewQuantity: 200}, f.userA)
+	if err != nil {
+		t.Fatalf("ajuste decremento: %v", err)
+	}
+	if m == nil || m.QuantityBase != -300 {
+		t.Fatalf("movimiento decremento inesperado: %+v", m)
+	}
+	if stock != 200 || f.warehouseStock(t, f.supplyA) != 200 {
+		t.Fatalf("stock decremento: esperaba 200, obtuvo %d", stock)
+	}
+	if f.warehouseStock(t, f.supplyA) != f.sumWarehouseMovements(t, f.supplyA) {
+		t.Fatalf("invariante rota tras decremento")
+	}
+
+	// No-op: fijar al mismo valor (200) NO inserta movimiento.
+	before := f.countWarehouseMovements(t, f.supplyA)
+	m, stock, err = f.svc.AdjustStock(ctx, f.tenantA, f.supplyA, AdjustInput{NewQuantity: 200}, f.userA)
+	if err != nil {
+		t.Fatalf("ajuste no-op: %v", err)
+	}
+	if m != nil {
+		t.Fatalf("no-op: esperaba movimiento nil, obtuvo %+v", m)
+	}
+	if stock != 200 {
+		t.Fatalf("no-op: stock esperaba 200, obtuvo %d", stock)
+	}
+	if after := f.countWarehouseMovements(t, f.supplyA); after != before {
+		t.Fatalf("no-op: no debía insertar movimiento (antes %d, después %d)", before, after)
+	}
+
+	// Cantidad negativa => ErrValidation (no toca nada).
+	if _, _, err := f.svc.AdjustStock(ctx, f.tenantA, f.supplyA, AdjustInput{NewQuantity: -1}, f.userA); !errors.Is(err, ErrValidation) {
+		t.Fatalf("negativo: esperaba ErrValidation, obtuvo %v", err)
+	}
+
+	// Insumo de otro tenant => ErrNotFound (aislamiento).
+	if _, _, err := f.svc.AdjustStock(ctx, f.tenantA, f.supplyB, AdjustInput{NewQuantity: 10}, f.userA); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("insumo ajeno: esperaba ErrNotFound, obtuvo %v", err)
+	}
+	// uuid inexistente => ErrNotFound.
+	if _, _, err := f.svc.AdjustStock(ctx, f.tenantA, "no-uuid", AdjustInput{NewQuantity: 10}, f.userA); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("insumo inexistente: esperaba ErrNotFound, obtuvo %v", err)
+	}
+
+	// Invariante tras mezclar con una compra: compra de 3 cajas (package_content 10)
+	// => +30 (stock 230), luego ajuste a 1000. stock_base debe seguir == SUM(ledger).
+	sp, err := f.svc.CreateSupplier(ctx, f.tenantA, SupplierInput{Name: "Prov"})
+	if err != nil {
+		t.Fatalf("crear proveedor: %v", err)
+	}
+	if _, _, err := f.svc.CreatePurchase(ctx, f.tenantA, PurchaseInput{
+		SupplyID: f.supplyA, SupplierID: sp.ID, Packages: 3, UnitCostCents: 100,
+	}, f.userA); err != nil {
+		t.Fatalf("compra: %v", err)
+	}
+	if _, stock, err = f.svc.AdjustStock(ctx, f.tenantA, f.supplyA, AdjustInput{NewQuantity: 1000}, f.userA); err != nil {
+		t.Fatalf("ajuste tras compra: %v", err)
+	}
+	if stock != 1000 {
+		t.Fatalf("stock tras compra+ajuste: esperaba 1000, obtuvo %d", stock)
+	}
+	if f.warehouseStock(t, f.supplyA) != f.sumWarehouseMovements(t, f.supplyA) {
+		t.Fatalf("invariante rota tras compra+ajuste")
 	}
 }
 

@@ -157,14 +157,19 @@ func deriveStatus(stockBase int, min *int) string {
 
 // listStock devuelve todos los supplies del tenant (LEFT JOIN warehouse_stock), con
 // stock/min/max y status derivado. Supply sin fila => stock 0, sin mín/máx.
-func (s *store) listStock(ctx context.Context, tenantID string) ([]WarehouseStockItem, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT sp.id::text, sp.name, sp.base_unit, sp.package_name, sp.package_content,
-		        sp.package_cost_cents, COALESCE(ws.stock_base, 0), ws.min_quantity, ws.max_quantity
-		   FROM supplies sp
-		   LEFT JOIN warehouse_stock ws ON ws.supply_id = sp.id
-		  WHERE sp.tenant_id = $1
-		  ORDER BY sp.name`, tenantID)
+func (s *store) listStock(ctx context.Context, tenantID string, status *string) ([]WarehouseStockItem, error) {
+	args := []any{tenantID}
+	q := `SELECT sp.id::text, sp.name, sp.base_unit, sp.package_name, sp.package_content,
+	             sp.package_cost_cents, COALESCE(ws.stock_base, 0), ws.min_quantity, ws.max_quantity
+	        FROM supplies sp
+	        LEFT JOIN warehouse_stock ws ON ws.supply_id = sp.id
+	       WHERE sp.tenant_id = $1`
+	if status != nil {
+		args = append(args, *status)
+		q += ` AND sp.status = $2`
+	}
+	q += ` ORDER BY sp.name`
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -374,6 +379,67 @@ func (s *store) listPurchases(ctx context.Context, tenantID string, from, to *ti
 		out = append(out, it)
 	}
 	return out, rows.Err()
+}
+
+// ---- Ajuste manual (adjustment) --------------------------------------------
+
+// insertAdjustment FIJA la existencia del almacén de un insumo al total deseado
+// (newQuantity, NO un delta): calcula la diferencia firmada contra el stock actual y,
+// en UNA transacción, inserta un movimiento 'adjustment' con esa diferencia y
+// actualiza el cache. Respeta el invariante stock_base == SUM(quantity_base). Si el
+// valor deseado ya es el actual, es un NO-OP: no inserta movimiento (respeta
+// CHECK(quantity_base <> 0)) y devuelve movimiento nil con el stock actual.
+//
+// Lee (y bloquea) la fila del cache con FOR UPDATE para serializar ajustes
+// concurrentes del mismo insumo (mismo orden de bloqueo que el resto: warehouse_stock
+// primero). Fila lazy (sin fila) => stock actual 0.
+func (s *store) insertAdjustment(ctx context.Context, tenantID, supplyID string, newQuantity int, createdBy string, createdAt *time.Time) (*WarehouseMovement, int, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	var current int
+	err = tx.QueryRow(ctx,
+		`SELECT stock_base FROM warehouse_stock WHERE supply_id = $1 AND tenant_id = $2 FOR UPDATE`,
+		supplyID, tenantID).Scan(&current)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, 0, err
+	}
+	// pgx.ErrNoRows => fila lazy inexistente: current queda en 0.
+
+	delta := newQuantity - current
+	if delta == 0 {
+		// No-op: ya está en el valor deseado. Se commitea para liberar el lock.
+		if err := tx.Commit(ctx); err != nil {
+			return nil, 0, err
+		}
+		return nil, current, nil
+	}
+
+	var m WarehouseMovement
+	err = tx.QueryRow(ctx,
+		`INSERT INTO warehouse_movements
+		     (tenant_id, supply_id, type, quantity_base, created_by, created_at)
+		 VALUES ($1, $2, 'adjustment', $3, $4, COALESCE($5, now()))
+		 RETURNING id::text, tenant_id::text, supply_id::text, type, quantity_base,
+		           branch_id::text, supplier_id::text, packages, unit_cost_cents, reason, created_by::text, created_at`,
+		tenantID, supplyID, delta, createdBy, createdAt).
+		Scan(&m.ID, &m.TenantID, &m.SupplyID, &m.Type, &m.QuantityBase, &m.BranchID, &m.SupplierID,
+			&m.Packages, &m.UnitCostCents, &m.Reason, &m.CreatedBy, &m.CreatedAt)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	stockBase, err := upsertWarehouseStock(ctx, tx, tenantID, supplyID, delta)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, err
+	}
+	return &m, stockBase, nil
 }
 
 // ---- Salidas (dispatch) — núcleo de R1/R2 (ADR-008) ------------------------

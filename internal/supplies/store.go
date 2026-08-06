@@ -199,17 +199,42 @@ func (s *store) update(ctx context.Context, tenantID, id string, name, status, p
 	return sp, nil
 }
 
+// softDelete da de BAJA un insumo (status='inactive') sin borrarlo: el historial de
+// movimientos y las recetas que lo referencian se preservan intactos. Idempotente:
+// dar de baja uno ya inactivo devuelve OK. uuid mal formado / ajeno => ErrNotFound.
+func (s *store) softDelete(ctx context.Context, tenantID, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE supplies SET status = 'inactive' WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID)
+	if pgCode(err, "22P02") {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // list devuelve los insumos del tenant con sus existencias por sucursal. Se hacen
 // dos consultas (evita N+1): insumos + todas las filas de cache del tenant, y se
 // agrupan en memoria. Solo aparecen las sucursales con fila en supply_branch_stock;
 // una sucursal ausente = 0 (lo interpreta la UI). Ver decisión en model.go.
-func (s *store) list(ctx context.Context, tenantID string) ([]Supply, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT sp.id::text, sp.tenant_id::text, sp.name, sp.base_unit, sp.package_name, sp.package_content,
-		        sp.package_cost_cents, sp.category_id::text, cat.name, sp.status, sp.created_at
-		   FROM supplies sp
-		   LEFT JOIN supply_categories cat ON cat.id = sp.category_id
-		  WHERE sp.tenant_id = $1 ORDER BY sp.name`, tenantID)
+func (s *store) list(ctx context.Context, tenantID string, status *string) ([]Supply, error) {
+	args := []any{tenantID}
+	q := `SELECT sp.id::text, sp.tenant_id::text, sp.name, sp.base_unit, sp.package_name, sp.package_content,
+	             sp.package_cost_cents, sp.category_id::text, cat.name, sp.status, sp.created_at
+	        FROM supplies sp
+	        LEFT JOIN supply_categories cat ON cat.id = sp.category_id
+	       WHERE sp.tenant_id = $1`
+	if status != nil {
+		args = append(args, *status)
+		q += ` AND sp.status = $2`
+	}
+	q += ` ORDER BY sp.name`
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

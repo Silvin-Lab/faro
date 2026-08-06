@@ -82,8 +82,19 @@ func (svc *Service) UpdateSupplier(ctx context.Context, tenantID, id string, in 
 
 // ---- Stock del almacén + mín/máx -------------------------------------------
 
-func (svc *Service) ListStock(ctx context.Context, tenantID string) ([]WarehouseStockItem, error) {
-	return svc.store.listStock(ctx, tenantID)
+// ListStock devuelve las existencias del almacén. status opcional (nil = todos,
+// incluye insumos dados de baja que aún tengan stock); "active"/"inactive" filtran
+// por estado del insumo (el select de "nuevo insumo para compra" usa ?status=active
+// para no ofrecer insumos dados de baja). status inválido => ErrValidation.
+func (svc *Service) ListStock(ctx context.Context, tenantID string, status *string) ([]WarehouseStockItem, error) {
+	if status != nil {
+		s := strings.TrimSpace(*status)
+		if s != "active" && s != "inactive" {
+			return nil, ErrValidation
+		}
+		status = &s
+	}
+	return svc.store.listStock(ctx, tenantID, status)
 }
 
 func (svc *Service) ToBuy(ctx context.Context, tenantID string) ([]ToBuyItem, error) {
@@ -118,6 +129,36 @@ func (svc *Service) UpdateMinMax(ctx context.Context, tenantID, supplyID string,
 		return WarehouseStockItem{}, ErrNotFound
 	}
 	return svc.store.upsertMinMax(ctx, tenantID, supplyID, in)
+}
+
+// ---- Ajuste manual de existencia -------------------------------------------
+
+// AdjustInput fija la existencia TOTAL deseada del almacén para un insumo (NO un
+// delta: el usuario escribe "cuánto tengo ahorita"). Date opcional (backdating),
+// igual que compra/salida/merma.
+type AdjustInput struct {
+	NewQuantity int
+	Date        string
+}
+
+// AdjustStock fija la existencia del almacén al total deseado registrando un
+// movimiento 'adjustment' con la diferencia firmada contra el stock actual. Valida
+// NewQuantity >= 0 (ErrValidation) e insumo del tenant (ErrNotFound). Devuelve el
+// movimiento (nil si el valor no cambió: no-op) y el nuevo stock_base.
+func (svc *Service) AdjustStock(ctx context.Context, tenantID, supplyID string, in AdjustInput, createdBy string) (*WarehouseMovement, int, error) {
+	if in.NewQuantity < 0 {
+		return nil, 0, ErrValidation
+	}
+	supplyID = strings.TrimSpace(supplyID)
+	ok, err := svc.supplyOK(ctx, tenantID, supplyID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !ok {
+		return nil, 0, ErrNotFound
+	}
+	createdAt := resolveCreatedAt(in.Date, svc.nowUTC())
+	return svc.store.insertAdjustment(ctx, tenantID, supplyID, in.NewQuantity, createdBy, createdAt)
 }
 
 // ---- Compras ---------------------------------------------------------------

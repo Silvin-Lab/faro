@@ -95,8 +95,26 @@ func (svc *Service) Create(ctx context.Context, tenantID, name, baseUnit, packag
 	return svc.store.create(ctx, tenantID, name, baseUnit, packageName, packageContent, packageCostCents, categoryID)
 }
 
-func (svc *Service) List(ctx context.Context, tenantID string) ([]Supply, error) {
-	return svc.store.list(ctx, tenantID)
+// List devuelve el catálogo de insumos del tenant. status opcional (nil = todos);
+// "active"/"inactive" filtran por estado (los selects de "nuevo insumo para
+// receta/compra" usan ?status=active para no ofrecer insumos dados de baja). status
+// inválido => ErrValidation.
+func (svc *Service) List(ctx context.Context, tenantID string, status *string) ([]Supply, error) {
+	if status != nil {
+		s := strings.TrimSpace(*status)
+		if s != "active" && s != "inactive" {
+			return nil, ErrValidation
+		}
+		status = &s
+	}
+	return svc.store.list(ctx, tenantID, status)
+}
+
+// SoftDelete da de baja un insumo (status='inactive'): "eliminar" sin borrar. El
+// insumo desaparece de los selects activos pero sigue en historiales y recetas
+// existentes. Idempotente. Insumo ajeno/inexistente => ErrNotFound.
+func (svc *Service) SoftDelete(ctx context.Context, tenantID, id string) error {
+	return svc.store.softDelete(ctx, tenantID, id)
 }
 
 func (svc *Service) Get(ctx context.Context, tenantID, id string) (Supply, error) {

@@ -245,7 +245,7 @@ func TestSupplyWithCategory(t *testing.T) {
 	}
 
 	// LIST devuelve categoryName por insumo (orden por nombre: Azúcar, Café..., Leche, Sal).
-	items, _ := f.svc.List(ctx, f.tenantA)
+	items, _ := f.svc.List(ctx, f.tenantA, nil)
 	byName := map[string]*string{}
 	for _, it := range items {
 		byName[it.Name] = it.CategoryName
@@ -391,7 +391,7 @@ func TestPackageCost(t *testing.T) {
 	}
 
 	// Round-trip por LIST (ordenado por nombre: Azúcar, Leche).
-	items, _ := f.svc.List(ctx, f.tenantA)
+	items, _ := f.svc.List(ctx, f.tenantA, nil)
 	byName := map[string]*int{}
 	for _, it := range items {
 		byName[it.Name] = it.PackageCostCents
@@ -614,7 +614,7 @@ func TestListStock(t *testing.T) {
 	packages := 2
 	f.svc.CreateMovement(ctx, f.tenantA, sp.ID, MovementInput{Type: "purchase", BranchID: f.branchA1, Packages: &packages}, f.userA)
 
-	items, err := f.svc.List(ctx, f.tenantA)
+	items, err := f.svc.List(ctx, f.tenantA, nil)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -630,7 +630,7 @@ func TestListStock(t *testing.T) {
 	}
 
 	// Aislamiento: tenant B no ve el insumo de A.
-	itemsB, _ := f.svc.List(ctx, f.tenantB)
+	itemsB, _ := f.svc.List(ctx, f.tenantB, nil)
 	if len(itemsB) != 0 {
 		t.Fatalf("tenant B esperaba 0 insumos, obtuvo %d", len(itemsB))
 	}
@@ -828,7 +828,7 @@ func TestSupplyMeasureCRUD(t *testing.T) {
 	if len(got.Measures) != 2 {
 		t.Fatalf("Get.Measures esperaba 2, obtuvo %d", len(got.Measures))
 	}
-	items, _ := f.svc.List(ctx, f.tenantA)
+	items, _ := f.svc.List(ctx, f.tenantA, nil)
 	for _, it := range items {
 		if it.ID == choco.ID && len(it.Measures) != 2 {
 			t.Fatalf("List.Measures esperaba 2, obtuvo %d", len(it.Measures))
@@ -1132,5 +1132,102 @@ func TestSaleDeductsByMeasureQuantityBase(t *testing.T) {
 	f.simulateSaleDeduct(t, f.tenantA, f.prodA, f.branchA1, 1) // 1 * 30 = 30
 	if got := f.cacheStock(t, choco.ID, f.branchA1); got != 920 {
 		t.Fatalf("descuento tras recálculo: esperaba stock 920 (950-30), obtuvo %d", got)
+	}
+}
+
+// TestSoftDeleteAndStatusFilter cubre la baja lógica de insumos: DELETE => status
+// 'inactive' (sin borrar datos), el filtro ?status del listado (los selects activos
+// no ofrecen insumos dados de baja), idempotencia, aislamiento por tenant, y que el
+// insumo inactivo siga apareciendo en recetas existentes que lo referencian.
+func TestSoftDeleteAndStatusFilter(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	leche, err := f.svc.Create(ctx, f.tenantA, "Leche", "ml", "Bote 900 ml", 900, nil, nil)
+	if err != nil {
+		t.Fatalf("crear leche: %v", err)
+	}
+	azucar, err := f.svc.Create(ctx, f.tenantA, "Azúcar", "g", "Bolsa 1kg", 1000, nil, nil)
+	if err != nil {
+		t.Fatalf("crear azúcar: %v", err)
+	}
+
+	// Receta del producto A referencia la leche (para probar que sobrevive a la baja).
+	if _, err := f.svc.ReplaceRecipe(ctx, f.tenantA, f.prodA, []recipeItemIn{
+		{SupplyID: leche.ID, QuantityBase: 100},
+	}); err != nil {
+		t.Fatalf("receta con leche: %v", err)
+	}
+
+	// Baja lógica de la leche.
+	if err := f.svc.SoftDelete(ctx, f.tenantA, leche.ID); err != nil {
+		t.Fatalf("soft-delete leche: %v", err)
+	}
+	// Su status quedó inactive (no se borró la fila).
+	got, err := f.svc.Get(ctx, f.tenantA, leche.ID)
+	if err != nil || got.Status != "inactive" {
+		t.Fatalf("leche tras baja: status=%q err=%v", got.Status, err)
+	}
+
+	// Listado sin filtro: aparecen ambos (catálogo completo).
+	all, err := f.svc.List(ctx, f.tenantA, nil)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("listado completo: esperaba 2, obtuvo %d (err=%v)", len(all), err)
+	}
+	// ?status=active: solo el azúcar (el select de "nuevo insumo" NO ofrece la leche).
+	active := "active"
+	act, err := f.svc.List(ctx, f.tenantA, &active)
+	if err != nil {
+		t.Fatalf("listado activo: %v", err)
+	}
+	if len(act) != 1 || act[0].ID != azucar.ID {
+		t.Fatalf("listado activo inesperado: %+v", act)
+	}
+	// ?status=inactive: solo la leche.
+	inactive := "inactive"
+	inact, err := f.svc.List(ctx, f.tenantA, &inactive)
+	if err != nil {
+		t.Fatalf("listado inactivo: %v", err)
+	}
+	if len(inact) != 1 || inact[0].ID != leche.ID {
+		t.Fatalf("listado inactivo inesperado: %+v", inact)
+	}
+	// status inválido => ErrValidation.
+	bad := "borrado"
+	if _, err := f.svc.List(ctx, f.tenantA, &bad); !errors.Is(err, ErrValidation) {
+		t.Fatalf("status inválido: esperaba ErrValidation, obtuvo %v", err)
+	}
+
+	// La receta existente sigue mostrando la leche pese a estar inactiva.
+	recipe, err := f.svc.GetRecipe(ctx, f.tenantA, f.prodA)
+	if err != nil {
+		t.Fatalf("receta tras baja: %v", err)
+	}
+	if len(recipe) != 1 || recipe[0].SupplyID != leche.ID {
+		t.Fatalf("receta perdió la leche inactiva: %+v", recipe)
+	}
+
+	// Idempotente: volver a dar de baja no falla.
+	if err := f.svc.SoftDelete(ctx, f.tenantA, leche.ID); err != nil {
+		t.Fatalf("soft-delete idempotente: %v", err)
+	}
+	// Aislamiento: baja de un insumo de otro tenant => ErrNotFound.
+	if err := f.svc.SoftDelete(ctx, f.tenantB, leche.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("baja insumo ajeno: esperaba ErrNotFound, obtuvo %v", err)
+	}
+	// uuid mal formado => ErrNotFound.
+	if err := f.svc.SoftDelete(ctx, f.tenantA, "no-uuid"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("baja uuid inválido: esperaba ErrNotFound, obtuvo %v", err)
+	}
+
+	// Un insumo dado de baja se puede reactivar vía PATCH status=active (no queda atrapado).
+	reactivate := "active"
+	if _, err := f.svc.Update(ctx, f.tenantA, leche.ID, UpdateInput{Status: &reactivate}); err != nil {
+		t.Fatalf("reactivar leche: %v", err)
+	}
+	act2, _ := f.svc.List(ctx, f.tenantA, &active)
+	if len(act2) != 2 {
+		t.Fatalf("tras reactivar: esperaba 2 activos, obtuvo %d", len(act2))
 	}
 }
