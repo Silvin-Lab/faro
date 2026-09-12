@@ -23,6 +23,7 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	r.Get("/second-visit", svc.handleSecondVisit)
 	r.Get("/basket-affinity", svc.handleBasketAffinity)
 	r.Get("/loyalty-effect", svc.handleLoyaltyEffect)
+	r.Get("/bakery-trend", svc.handleBakeryTrend)
 	return r
 }
 
@@ -171,6 +172,63 @@ func (svc *Service) handleLoyaltyEffect(w http.ResponseWriter, r *http.Request) 
 	res, err := svc.LoyaltyEffect(r.Context(), sc)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo calcular la efectividad de lealtad")
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// resolveBakeryScope aplica la autorización por rol de la tendencia de postres (F19), que
+// difiere de resolveScope: además de super_admin/branch_admin, INCLUYE al repostero (todas
+// las sucursales, sin sucursal activa). cashier/barista => 403. Devuelve ok=false tras
+// escribir el error HTTP.
+func (svc *Service) resolveBakeryScope(w http.ResponseWriter, r *http.Request) (BakeryScope, bool) {
+	u, okU := auth.UserFromContext(r.Context())
+	if !okU {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return BakeryScope{}, false
+	}
+	// super_admin, branch_admin y repostero pueden ver la tendencia; el resto no.
+	if !u.IsSuperAdmin && u.Role != auth.RoleBranchAdmin && u.Role != auth.RoleRepostero {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ver la tendencia de postres")
+		return BakeryScope{}, false
+	}
+	tenantID, okT := auth.ResolveTenant(w, r)
+	if !okT {
+		return BakeryScope{}, false
+	}
+	tz, _ := strconv.Atoi(r.URL.Query().Get("tz"))
+
+	var branch BranchFilter
+	if u.IsSuperAdmin || u.Role == auth.RoleRepostero {
+		// Ven todas las sucursales; ?branchId=<uuid> acota; ?branchId=none|null es el
+		// bucket "Sin sucursal".
+		if b := r.URL.Query().Get("branchId"); b != "" {
+			if b == "none" || b == "null" {
+				branch.None = true
+			} else {
+				branch.ID = &b
+			}
+		}
+	} else {
+		// branch_admin: SIEMPRE forzado a su sucursal activa; se ignora ?branchId.
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		if active == nil {
+			writeError(w, http.StatusBadRequest, "branch_required", "Selecciona una sucursal activa")
+			return BakeryScope{}, false
+		}
+		branch.ID = active
+	}
+	return BakeryScope{TenantID: tenantID, TZ: tz, Branch: branch}, true
+}
+
+func (svc *Service) handleBakeryTrend(w http.ResponseWriter, r *http.Request) {
+	sc, ok := svc.resolveBakeryScope(w, r)
+	if !ok {
+		return
+	}
+	res, err := svc.BakeryTrend(r.Context(), sc)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo calcular la tendencia de postres")
 		return
 	}
 	writeJSON(w, http.StatusOK, res)

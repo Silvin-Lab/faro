@@ -11,35 +11,49 @@ import (
 	"faro/internal/auth"
 )
 
-// Routes se monta en /warehouse. TODO el módulo (lectura y escritura) exige
-// super_admin: el router pasa requireSuperAdmin y se aplica a todas las rutas
-// (tech-spec §1, handoff §1.2).
-func (svc *Service) Routes(requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
+// Routes se monta en /warehouse. El módulo es de super_admin salvo UNA excepción:
+// GET /stock también lo lee el repostero (M10, F17). Para abrirla sin exponer el resto,
+// el router se divide en dos subgrupos (tech-spec §7.2):
+//   - un grupo bajo requireSession con GET /stock y autorización INLINE por rol
+//     (super_admin || repostero; si no => 403);
+//   - un grupo bajo requireSuperAdmin con TODO lo demás (escritura + resto de lectura).
+// Regresión (§8): branch_admin/cashier/barista => 403 en TODO /warehouse; repostero =>
+// 403 en todo /warehouse EXCEPTO GET /stock.
+func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Use(requireSuperAdmin)
 
-	// Existencias + mín/máx + ajuste manual + a-comprar.
-	r.Get("/stock", svc.handleListStock)
-	r.Patch("/stock/{supplyId}", svc.handleUpdateMinMax)
-	r.Post("/stock/{supplyId}/adjust", svc.handleAdjustStock)
-	r.Get("/to-buy", svc.handleToBuy)
+	// Lectura de existencias abierta a repostero (F17): sesión + gating inline.
+	r.Group(func(r chi.Router) {
+		r.Use(requireSession)
+		r.Get("/stock", svc.handleListStock)
+	})
 
-	// Proveedores.
-	r.Get("/suppliers", svc.handleListSuppliers)
-	r.Post("/suppliers", svc.handleCreateSupplier)
-	r.Patch("/suppliers/{id}", svc.handleUpdateSupplier)
+	// Todo lo demás sigue exclusivo de super_admin.
+	r.Group(func(r chi.Router) {
+		r.Use(requireSuperAdmin)
 
-	// Compras.
-	r.Post("/purchases", svc.handleCreatePurchase)
-	r.Get("/purchases", svc.handleListPurchases)
+		// Mín/máx + ajuste manual + a-comprar.
+		r.Patch("/stock/{supplyId}", svc.handleUpdateMinMax)
+		r.Post("/stock/{supplyId}/adjust", svc.handleAdjustStock)
+		r.Get("/to-buy", svc.handleToBuy)
 
-	// Salidas.
-	r.Post("/dispatches", svc.handleCreateDispatch)
-	r.Get("/dispatches", svc.handleListDispatches)
+		// Proveedores.
+		r.Get("/suppliers", svc.handleListSuppliers)
+		r.Post("/suppliers", svc.handleCreateSupplier)
+		r.Patch("/suppliers/{id}", svc.handleUpdateSupplier)
 
-	// Mermas.
-	r.Post("/waste", svc.handleCreateWaste)
-	r.Get("/waste", svc.handleListWaste)
+		// Compras.
+		r.Post("/purchases", svc.handleCreatePurchase)
+		r.Get("/purchases", svc.handleListPurchases)
+
+		// Salidas.
+		r.Post("/dispatches", svc.handleCreateDispatch)
+		r.Get("/dispatches", svc.handleListDispatches)
+
+		// Mermas.
+		r.Post("/waste", svc.handleCreateWaste)
+		r.Get("/waste", svc.handleListWaste)
+	})
 
 	return r
 }
@@ -139,6 +153,17 @@ func (svc *Service) handleUpdateSupplier(w http.ResponseWriter, r *http.Request)
 // ---- Existencias + mín/máx -------------------------------------------------
 
 func (svc *Service) handleListStock(w http.ResponseWriter, r *http.Request) {
+	// Autorización inline (§7.2): solo super_admin y repostero (F17). El resto de
+	// /warehouse sigue bajo requireSuperAdmin en el router.
+	u, okU := auth.UserFromContext(r.Context())
+	if !okU {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
+	if !u.IsSuperAdmin && u.Role != auth.RoleRepostero {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ver el almacén")
+		return
+	}
 	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return

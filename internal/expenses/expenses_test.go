@@ -156,7 +156,7 @@ func TestCreateExpense(t *testing.T) {
 	con, _ := f.svc.CreateConcept(ctx, f.tenantA, &cat.ID, "Luz")
 
 	// Gasto válido: snapshot de nombre y campos derivados.
-	e, err := f.svc.CreateExpense(ctx, f.tenantA, f.branchA1, con.ID, 15000, f.userA)
+	e, err := f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, con.ID, 15000, f.userA)
 	if err != nil {
 		t.Fatalf("crear gasto: %v", err)
 	}
@@ -182,25 +182,78 @@ func TestCreateExpense(t *testing.T) {
 	}
 
 	// Monto <= 0 -> validación.
-	if _, err := f.svc.CreateExpense(ctx, f.tenantA, f.branchA1, con.ID, 0, f.userA); !errors.Is(err, ErrValidation) {
+	if _, err := f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, con.ID, 0, f.userA); !errors.Is(err, ErrValidation) {
 		t.Fatalf("monto 0: esperaba ErrValidation, obtuvo %v", err)
 	}
-	if _, err := f.svc.CreateExpense(ctx, f.tenantA, f.branchA1, con.ID, -100, f.userA); !errors.Is(err, ErrValidation) {
+	if _, err := f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, con.ID, -100, f.userA); !errors.Is(err, ErrValidation) {
 		t.Fatalf("monto negativo: esperaba ErrValidation, obtuvo %v", err)
 	}
 
 	// Concepto inactivo -> invalid_concept.
 	inactive := "inactive"
 	f.svc.UpdateConcept(ctx, f.tenantA, con.ID, ConceptUpdate{Status: &inactive})
-	if _, err := f.svc.CreateExpense(ctx, f.tenantA, f.branchA1, con.ID, 100, f.userA); !errors.Is(err, ErrInvalidConcept) {
+	if _, err := f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, con.ID, 100, f.userA); !errors.Is(err, ErrInvalidConcept) {
 		t.Fatalf("concepto inactivo: esperaba ErrInvalidConcept, obtuvo %v", err)
 	}
 
 	// Concepto de OTRO tenant -> invalid_concept.
 	catB, _ := f.svc.CreateCategory(ctx, f.tenantB, "SB", 0)
 	conB, _ := f.svc.CreateConcept(ctx, f.tenantB, &catB.ID, "AguaB")
-	if _, err := f.svc.CreateExpense(ctx, f.tenantA, f.branchA1, conB.ID, 100, f.userA); !errors.Is(err, ErrInvalidConcept) {
+	if _, err := f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, conB.ID, 100, f.userA); !errors.Is(err, ErrInvalidConcept) {
 		t.Fatalf("concepto ajeno: esperaba ErrInvalidConcept, obtuvo %v", err)
+	}
+}
+
+// TestCreateExpenseBranch cubre la sucursal opcional (0021): gasto "General" (branch
+// nil), gasto con sucursal válida y validación de sucursal ajena/inexistente.
+func TestCreateExpenseBranch(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	cat, _ := f.svc.CreateCategory(ctx, f.tenantA, "Corporativo", 0)
+	con, _ := f.svc.CreateConcept(ctx, f.tenantA, &cat.ID, "Contador")
+
+	// Gasto "General": branchID nil => se persiste sin sucursal.
+	gen, err := f.svc.CreateExpense(ctx, f.tenantA, nil, con.ID, 50000, f.userA)
+	if err != nil {
+		t.Fatalf("gasto General: %v", err)
+	}
+	if gen.BranchID != nil || gen.BranchName != nil {
+		t.Fatalf("gasto General debía tener branch nil, obtuvo %+v/%+v", gen.BranchID, gen.BranchName)
+	}
+
+	// Gasto con sucursal válida del tenant => queda esa sucursal.
+	e, err := f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, con.ID, 12000, f.userA)
+	if err != nil {
+		t.Fatalf("gasto con sucursal: %v", err)
+	}
+	if e.BranchID == nil || *e.BranchID != f.branchA1 {
+		t.Fatalf("gasto debía quedar en branchA1, obtuvo %+v", e.BranchID)
+	}
+
+	// Sucursal de OTRO tenant => ErrInvalidBranch.
+	if _, err := f.svc.CreateExpense(ctx, f.tenantA, &f.branchB1, con.ID, 1000, f.userA); !errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf("sucursal ajena: esperaba ErrInvalidBranch, obtuvo %v", err)
+	}
+	// Sucursal inexistente (uuid válido pero ausente) => ErrInvalidBranch.
+	ghost := "00000000-0000-0000-0000-000000000000"
+	if _, err := f.svc.CreateExpense(ctx, f.tenantA, &ghost, con.ID, 1000, f.userA); !errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf("sucursal inexistente: esperaba ErrInvalidBranch, obtuvo %v", err)
+	}
+	// Uuid mal formado => ErrInvalidBranch (no 500).
+	bad := "no-es-uuid"
+	if _, err := f.svc.CreateExpense(ctx, f.tenantA, &bad, con.ID, 1000, f.userA); !errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf("branchId mal formado: esperaba ErrInvalidBranch, obtuvo %v", err)
+	}
+	// branchID vacío ("") se normaliza a nil => gasto General (no invalid_branch).
+	empty := "   "
+	ge, err := f.svc.CreateExpense(ctx, f.tenantA, &empty, con.ID, 1000, f.userA)
+	if err != nil {
+		t.Fatalf("branchId vacío debía tratarse como General: %v", err)
+	}
+	if ge.BranchID != nil {
+		t.Fatalf("branchId vacío debía quedar nil, obtuvo %+v", ge.BranchID)
 	}
 }
 
@@ -214,12 +267,12 @@ func TestListExpenses(t *testing.T) {
 	con, _ := f.svc.CreateConcept(ctx, f.tenantA, &cat.ID, "Luz")
 
 	// A1: dos gastos; A2: uno; B1: uno (aislamiento).
-	f.svc.CreateExpense(ctx, f.tenantA, f.branchA1, con.ID, 100, f.userA)
-	f.svc.CreateExpense(ctx, f.tenantA, f.branchA1, con.ID, 200, f.userA)
-	f.svc.CreateExpense(ctx, f.tenantA, f.branchA2, con.ID, 300, f.userA)
+	f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, con.ID, 100, f.userA)
+	f.svc.CreateExpense(ctx, f.tenantA, &f.branchA1, con.ID, 200, f.userA)
+	f.svc.CreateExpense(ctx, f.tenantA, &f.branchA2, con.ID, 300, f.userA)
 	catB, _ := f.svc.CreateCategory(ctx, f.tenantB, "SB", 0)
 	conB, _ := f.svc.CreateConcept(ctx, f.tenantB, &catB.ID, "AguaB")
-	f.svc.CreateExpense(ctx, f.tenantB, f.branchB1, conB.ID, 999, f.userB)
+	f.svc.CreateExpense(ctx, f.tenantB, &f.branchB1, conB.ID, 999, f.userB)
 
 	// Sucursal A1 -> 2 gastos.
 	l1, err := f.svc.ListExpenses(ctx, f.tenantA, &f.branchA1, nil, nil)
@@ -264,7 +317,7 @@ func TestDeleteTenantIsolation(t *testing.T) {
 
 	catB, _ := f.svc.CreateCategory(ctx, f.tenantB, "SB", 0)
 	conB, _ := f.svc.CreateConcept(ctx, f.tenantB, &catB.ID, "AguaB")
-	eB, _ := f.svc.CreateExpense(ctx, f.tenantB, f.branchB1, conB.ID, 500, f.userB)
+	eB, _ := f.svc.CreateExpense(ctx, f.tenantB, &f.branchB1, conB.ID, 500, f.userB)
 
 	// Tenant A intenta leer el gasto de B para borrarlo -> ErrNotFound.
 	if _, _, err := f.svc.ExpenseForDelete(ctx, f.tenantA, eB.ID); !errors.Is(err, ErrNotFound) {

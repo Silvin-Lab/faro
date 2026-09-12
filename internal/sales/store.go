@@ -210,6 +210,15 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 		return Sale{}, err
 	}
 
+	// Descuento de stock de producto terminado (postres, M10): las líneas de productos
+	// 'bakery' descuentan su stock de postre por sucursal (product_branch_stock) y NO sus
+	// insumos (ya se consumieron al producir; ADR-010 D4). Se ejecuta en la MISMA
+	// transacción, justo después de deductSupplies. Sin solapamiento: cada función filtra
+	// por fulfillment_type en su JOIN (carrito mixto reparte correctamente, R1).
+	if err := deductFinishedGoods(ctx, tx, tenantID, sale.ID, sale.BranchID, lines); err != nil {
+		return Sale{}, err
+	}
+
 	// Lealtad: cada venta con cliente incrementa el contador de ciclo y el de por
 	// vida. Si se aplicó una promoción con descuento, se escribe el snapshot y —si
 	// la promoción reinicia— el contador de ciclo vuelve a 0.
@@ -257,6 +266,11 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 // producto sin receta no produce filas (no-op natural) y el stock puede quedar
 // negativo (no hay CHECK). Si branchID es nil se omite (defensivo; el handler ya
 // exige sucursal). NO se tragan errores: si el SQL falla, la venta falla completa.
+//
+// M10 (ADR-010 D4): SOLO descuenta insumos de productos 'branch_prepared'. Los postres
+// ('bakery') NO entran en la CTE `consumo` (JOIN products con fulfillment_type filtrado)
+// porque sus insumos ya se consumieron al producir en la central; su venta descuenta
+// stock de postre en deductFinishedGoods. Evita la doble contabilidad (R1).
 func deductSupplies(ctx context.Context, tx pgx.Tx, tenantID, saleID string, branchID *string, lines []computedLine) error {
 	if branchID == nil {
 		return nil
@@ -279,6 +293,9 @@ func deductSupplies(ctx context.Context, tx pgx.Tx, tenantID, saleID string, bra
 		 consumo AS (
 		     SELECT ps.supply_id, SUM(ps.quantity_base * l.qty)::int AS total
 		       FROM lineas l
+		       JOIN products p
+		         ON p.id = l.product_id AND p.tenant_id = $1
+		        AND p.fulfillment_type = 'branch_prepared'
 		       JOIN product_supplies ps
 		         ON ps.product_id = l.product_id AND ps.tenant_id = $1
 		   GROUP BY ps.supply_id
@@ -295,6 +312,58 @@ func deductSupplies(ctx context.Context, tx pgx.Tx, tenantID, saleID string, bra
 		  ORDER BY supply_id
 		 ON CONFLICT (supply_id, branch_id) DO UPDATE
 		    SET stock_base = supply_branch_stock.stock_base + EXCLUDED.stock_base,
+		        updated_at = now()`,
+		tenantID, saleID, *branchID, productIDs, qtys)
+	return err
+}
+
+// deductFinishedGoods descuenta el stock de PRODUCTO TERMINADO (postres, M10) consumido
+// por la venta, dentro de la MISMA transacción de la venta. Misma estructura que
+// deductSupplies (set-based, unnest+CTE, ORDER BY product_id anti-deadlock). SOLO afecta
+// líneas de productos 'bakery': por cada una escribe un movimiento product_stock_movements
+// (type='sale', quantity NEGATIVA, sale_id, created_by NULL) y hace upsert restando en
+// product_branch_stock (ON CONFLICT (product_id, branch_id)). No bloqueante: el stock de
+// postre puede quedar negativo (D-B), y un producto 'bakery' sin fila de stock la crea
+// lazy en negativo. Si branchID es nil se omite (defensivo). NO se tragan errores.
+func deductFinishedGoods(ctx context.Context, tx pgx.Tx, tenantID, saleID string, branchID *string, lines []computedLine) error {
+	if branchID == nil {
+		return nil
+	}
+	productIDs := make([]string, len(lines))
+	qtys := make([]int, len(lines))
+	for i, l := range lines {
+		productIDs[i] = l.productID
+		qtys[i] = l.quantity
+	}
+	// unnest de (product_id, qty) -> agrega por producto (mismo postre en varias líneas
+	// suma) filtrando SOLO 'bakery' vía JOIN products -> movimientos 'sale' (−qty) ->
+	// upsert del cache de postre restando. ORDER BY product_id da orden de bloqueo
+	// determinista (anti-deadlock) entre ventas concurrentes de la misma sucursal.
+	_, err := tx.Exec(ctx,
+		`WITH lineas AS (
+		     SELECT product_id, qty
+		       FROM unnest($4::uuid[], $5::int[]) AS u(product_id, qty)
+		 ),
+		 consumo AS (
+		     SELECT l.product_id, SUM(l.qty)::int AS total
+		       FROM lineas l
+		       JOIN products p
+		         ON p.id = l.product_id AND p.tenant_id = $1
+		        AND p.fulfillment_type = 'bakery'
+		   GROUP BY l.product_id
+		 ),
+		 mov AS (
+		     INSERT INTO product_stock_movements (tenant_id, product_id, branch_id, type, quantity, sale_id)
+		     SELECT $1, product_id, $3, 'sale', -total, $2
+		       FROM consumo
+		     RETURNING product_id, quantity
+		 )
+		 INSERT INTO product_branch_stock (tenant_id, product_id, branch_id, stock_qty)
+		 SELECT $1, product_id, $3, quantity
+		   FROM mov
+		  ORDER BY product_id
+		 ON CONFLICT (product_id, branch_id) DO UPDATE
+		    SET stock_qty = product_branch_stock.stock_qty + EXCLUDED.stock_qty,
 		        updated_at = now()`,
 		tenantID, saleID, *branchID, productIDs, qtys)
 	return err

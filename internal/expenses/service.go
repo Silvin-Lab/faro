@@ -115,12 +115,26 @@ func (svc *Service) UpdateConcept(ctx context.Context, tenantID, id string, in C
 
 // ---- Gastos ----------------------------------------------------------------
 
-func (svc *Service) CreateExpense(ctx context.Context, tenantID, branchID, conceptID string, amountCents int, createdBy string) (Expense, error) {
+// CreateExpense registra un gasto. branchID nil => gasto "General" (corporativo, sin
+// sucursal); si viene, debe pertenecer al tenant (ErrInvalidBranch si no). El handler
+// garantiza que solo el super_admin puede pasar branchID libremente; los usuarios de
+// sucursal siempre reciben su sucursal activa.
+func (svc *Service) CreateExpense(ctx context.Context, tenantID string, branchID *string, conceptID string, amountCents int, createdBy string) (Expense, error) {
 	if strings.TrimSpace(conceptID) == "" {
 		return Expense{}, ErrInvalidConcept
 	}
 	if amountCents <= 0 {
 		return Expense{}, ErrValidation
+	}
+	branchID = normalizeID(branchID)
+	if branchID != nil {
+		ok, err := svc.store.branchInTenant(ctx, tenantID, *branchID)
+		if err != nil {
+			return Expense{}, err
+		}
+		if !ok {
+			return Expense{}, ErrInvalidBranch
+		}
 	}
 	return svc.store.createExpense(ctx, tenantID, branchID, conceptID, amountCents, createdBy)
 }
@@ -130,8 +144,9 @@ func (svc *Service) ListExpenses(ctx context.Context, tenantID string, branchID 
 }
 
 // ExpenseForDelete devuelve la sucursal y fecha del gasto para que el handler
-// evalúe la matriz de borrado por rol. ErrNotFound si no es del tenant.
-func (svc *Service) ExpenseForDelete(ctx context.Context, tenantID, id string) (branchID string, createdAt time.Time, err error) {
+// evalúe la matriz de borrado por rol. branchID nil = gasto "General" (sin sucursal).
+// ErrNotFound si no es del tenant.
+func (svc *Service) ExpenseForDelete(ctx context.Context, tenantID, id string) (branchID *string, createdAt time.Time, err error) {
 	return svc.store.expenseForDelete(ctx, tenantID, id)
 }
 

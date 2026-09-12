@@ -28,10 +28,11 @@ func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) 
 }
 
 type createRequest struct {
-	Name       string  `json:"name"`
-	PriceCents int     `json:"priceCents"`
-	CategoryID *string `json:"categoryId"`
-	ImageURL   *string `json:"imageUrl"`
+	Name            string  `json:"name"`
+	PriceCents      int     `json:"priceCents"`
+	CategoryID      *string `json:"categoryId"`
+	ImageURL        *string `json:"imageUrl"`
+	FulfillmentType *string `json:"fulfillmentType"` // M10: branch_prepared (default) | bakery
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +45,7 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
 		return
 	}
-	p, err := svc.Create(r.Context(), tenantID, CreateInput{Name: req.Name, PriceCents: req.PriceCents, CategoryID: req.CategoryID, ImageURL: req.ImageURL})
+	p, err := svc.Create(r.Context(), tenantID, CreateInput{Name: req.Name, PriceCents: req.PriceCents, CategoryID: req.CategoryID, ImageURL: req.ImageURL, FulfillmentType: req.FulfillmentType})
 	writeResult(w, p, err, http.StatusCreated)
 }
 
@@ -81,11 +82,12 @@ func (svc *Service) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateRequest struct {
-	Name       *string `json:"name"`
-	PriceCents *int    `json:"priceCents"`
-	CategoryID *string `json:"categoryId"`
-	Status     *string `json:"status"`
-	ImageURL   *string `json:"imageUrl"`
+	Name            *string `json:"name"`
+	PriceCents      *int    `json:"priceCents"`
+	CategoryID      *string `json:"categoryId"`
+	Status          *string `json:"status"`
+	ImageURL        *string `json:"imageUrl"`
+	FulfillmentType *string `json:"fulfillmentType"` // M10: branch_prepared | bakery (regla D-C)
 }
 
 func (svc *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -99,18 +101,27 @@ func (svc *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, err := svc.Update(r.Context(), tenantID, chi.URLParam(r, "id"), UpdateInput{
-		Name: req.Name, PriceCents: req.PriceCents, CategoryID: req.CategoryID, Status: req.Status, ImageURL: req.ImageURL,
+		Name: req.Name, PriceCents: req.PriceCents, CategoryID: req.CategoryID, Status: req.Status, ImageURL: req.ImageURL, FulfillmentType: req.FulfillmentType,
 	})
 	writeResult(w, p, err, http.StatusOK)
 }
 
 // writeResult traduce el resultado del service a HTTP (errores comunes a crear/editar).
 func writeResult(w http.ResponseWriter, p Product, err error, okStatus int) {
+	var blocked *FulfillmentBlockedError
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Datos inválidos (nombre y precio > 0)")
 	case errors.Is(err, ErrInvalidCategory):
 		writeError(w, http.StatusBadRequest, "invalid_category", "La categoría no pertenece a este negocio")
+	case errors.As(err, &blocked):
+		// 409 con el conteo de bloqueadores (§3.3 D-C) para que la UI explique.
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":              "fulfillment_change_blocked",
+			"message":           "No se puede cambiar el tipo: hay pedidos abiertos o stock de postre",
+			"openOrders":        blocked.OpenOrders,
+			"branchesWithStock": blocked.BranchesWithStock,
+		})
 	case errors.Is(err, ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "Producto no encontrado")
 	case errors.Is(err, ErrNameTaken):

@@ -16,6 +16,7 @@ var (
 	ErrNameTaken       = errors.New("name taken")
 	ErrInvalidCategory = errors.New("invalid category")
 	ErrInvalidConcept  = errors.New("invalid concept")
+	ErrInvalidBranch   = errors.New("invalid branch")
 )
 
 type store struct {
@@ -87,6 +88,20 @@ func (s *store) updateCategory(ctx context.Context, tenantID, id string, name, s
 		return Category{}, err
 	}
 	return c, nil
+}
+
+// branchInTenant indica si la sucursal pertenece al tenant (copia local del patrón
+// de warehouse/store.go: no se exporta cross-módulo). uuid mal formado (22P02) o
+// sucursal ajena => false. Se usa para validar el branchId que envía el super_admin.
+func (s *store) branchInTenant(ctx context.Context, tenantID, branchID string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM branches WHERE id = $1 AND tenant_id = $2)`,
+		branchID, tenantID).Scan(&ok)
+	if pgCode(err, "22P02") {
+		return false, nil
+	}
+	return ok, err
 }
 
 // categoryExists indica si la categoría pertenece al tenant. Un uuid mal formado
@@ -182,7 +197,8 @@ func (s *store) updateConcept(ctx context.Context, tenantID, id string, name, st
 
 // createExpense inserta el gasto snapshoteando concept_name en la MISMA sentencia
 // (el concepto debe estar activo y ser del tenant). 0 filas => ErrInvalidConcept.
-func (s *store) createExpense(ctx context.Context, tenantID, branchID, conceptID string, amountCents int, createdBy string) (Expense, error) {
+// branchID nil => gasto "General" (branch_id NULL); la columna es nullable desde 0021.
+func (s *store) createExpense(ctx context.Context, tenantID string, branchID *string, conceptID string, amountCents int, createdBy string) (Expense, error) {
 	var e Expense
 	err := s.pool.QueryRow(ctx,
 		`WITH ins AS (
@@ -258,17 +274,18 @@ func (s *store) listExpenses(ctx context.Context, tenantID string, branchID *str
 }
 
 // expenseForDelete devuelve la sucursal y la fecha de creación del gasto (para que
-// el handler aplique la matriz de autorización por rol). Fuera del tenant o uuid
-// mal formado => ErrNotFound (aísla entre negocios y no filtra existencia).
-func (s *store) expenseForDelete(ctx context.Context, tenantID, id string) (branchID string, createdAt time.Time, err error) {
+// el handler aplique la matriz de autorización por rol). branchID nil = gasto
+// "General" (sin sucursal). Fuera del tenant o uuid mal formado => ErrNotFound
+// (aísla entre negocios y no filtra existencia).
+func (s *store) expenseForDelete(ctx context.Context, tenantID, id string) (branchID *string, createdAt time.Time, err error) {
 	err = s.pool.QueryRow(ctx,
 		`SELECT branch_id::text, created_at FROM expenses WHERE id = $1 AND tenant_id = $2`,
 		id, tenantID).Scan(&branchID, &createdAt)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
-		return "", time.Time{}, ErrNotFound
+		return nil, time.Time{}, ErrNotFound
 	case err != nil:
-		return "", time.Time{}, err
+		return nil, time.Time{}, err
 	}
 	return branchID, createdAt, nil
 }

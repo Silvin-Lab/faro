@@ -9,9 +9,27 @@ import (
 )
 
 var (
-	ErrValidation      = errors.New("validation")
-	ErrInvalidCategory = errors.New("invalid category")
+	ErrValidation         = errors.New("validation")
+	ErrInvalidCategory    = errors.New("invalid category")
+	ErrFulfillmentBlocked = errors.New("fulfillment change blocked")
 )
+
+// validFulfillmentType indica si el tipo de surtido es soportado (M10).
+func validFulfillmentType(t string) bool {
+	return t == "branch_prepared" || t == "bakery"
+}
+
+// FulfillmentBlockedError es el error tipado de un cambio bakery -> branch_prepared
+// bloqueado (§3.3 D-C): lleva los conteos de bloqueadores para el 409. Envuelve
+// ErrFulfillmentBlocked (errors.Is) y se extrae con errors.As. Thread-safe (no hay
+// estado compartido en el Service).
+type FulfillmentBlockedError struct {
+	OpenOrders        int
+	BranchesWithStock int
+}
+
+func (e *FulfillmentBlockedError) Error() string { return "fulfillment change blocked" }
+func (e *FulfillmentBlockedError) Unwrap() error  { return ErrFulfillmentBlocked }
 
 type Service struct {
 	store *store
@@ -38,10 +56,11 @@ func (svc *Service) normalizeCategory(ctx context.Context, tenantID string, cate
 }
 
 type CreateInput struct {
-	Name       string
-	PriceCents int
-	CategoryID *string
-	ImageURL   *string
+	Name            string
+	PriceCents      int
+	CategoryID      *string
+	ImageURL        *string
+	FulfillmentType *string // nil => default branch_prepared
 }
 
 func (svc *Service) Create(ctx context.Context, tenantID string, in CreateInput) (Product, error) {
@@ -49,11 +68,18 @@ func (svc *Service) Create(ctx context.Context, tenantID string, in CreateInput)
 	if name == "" || in.PriceCents <= 0 {
 		return Product{}, ErrValidation
 	}
+	ft := "branch_prepared"
+	if in.FulfillmentType != nil {
+		ft = strings.TrimSpace(*in.FulfillmentType)
+		if !validFulfillmentType(ft) {
+			return Product{}, ErrValidation
+		}
+	}
 	cat, err := svc.normalizeCategory(ctx, tenantID, in.CategoryID)
 	if err != nil {
 		return Product{}, err
 	}
-	return svc.store.create(ctx, tenantID, cat, name, in.PriceCents, normalizeURL(in.ImageURL))
+	return svc.store.create(ctx, tenantID, cat, name, in.PriceCents, normalizeURL(in.ImageURL), ft)
 }
 
 // normalizeURL convierte cadenas vacías en nil.
@@ -74,11 +100,12 @@ func (svc *Service) Get(ctx context.Context, tenantID, id string) (Product, erro
 }
 
 type UpdateInput struct {
-	Name       *string
-	PriceCents *int
-	CategoryID *string // nil = no cambia; valor = asigna (validado por negocio)
-	Status     *string
-	ImageURL   *string // nil = no cambia; valor = asigna
+	Name            *string
+	PriceCents      *int
+	CategoryID      *string // nil = no cambia; valor = asigna (validado por negocio)
+	Status          *string
+	ImageURL        *string // nil = no cambia; valor = asigna
+	FulfillmentType *string // nil = no cambia; valor = cambia (sujeto a la regla D-C)
 }
 
 func (svc *Service) Update(ctx context.Context, tenantID, id string, in UpdateInput) (Product, error) {
@@ -102,5 +129,31 @@ func (svc *Service) Update(ctx context.Context, tenantID, id string, in UpdateIn
 		}
 		in.CategoryID = cat // categoría validada (o nil si venía vacía)
 	}
-	return svc.store.update(ctx, tenantID, id, in.Name, in.PriceCents, in.CategoryID, in.Status, normalizeURL(in.ImageURL))
+	if in.FulfillmentType != nil {
+		ft := strings.TrimSpace(*in.FulfillmentType)
+		if !validFulfillmentType(ft) {
+			return Product{}, ErrValidation
+		}
+		in.FulfillmentType = &ft
+		// Regla D-C (§3.3): validar el cambio contra el estado actual bajo el mismo
+		// criterio cross-módulo que sales->supplies.
+		current, err := svc.store.currentFulfillmentType(ctx, tenantID, id)
+		if err != nil {
+			return Product{}, err
+		}
+		if current == "bakery" && ft == "branch_prepared" {
+			// bakery -> branch_prepared: bloqueado si hay pedidos abiertos o stock de postre
+			// distinto de 0 (evita pedidos inproducibles y doble contabilidad; ADR-010 R7).
+			openOrders, branchesWithStock, err := svc.store.fulfillmentChangeBlockers(ctx, tenantID, id)
+			if err != nil {
+				return Product{}, err
+			}
+			if openOrders > 0 || branchesWithStock > 0 {
+				return Product{}, &FulfillmentBlockedError{OpenOrders: openOrders, BranchesWithStock: branchesWithStock}
+			}
+		}
+		// branch_prepared -> bakery: permitido siempre (no pudo tener pedidos/stock).
+		// bakery -> bakery / branch_prepared -> branch_prepared: sin efecto.
+	}
+	return svc.store.update(ctx, tenantID, id, in.Name, in.PriceCents, in.CategoryID, in.Status, normalizeURL(in.ImageURL), in.FulfillmentType)
 }

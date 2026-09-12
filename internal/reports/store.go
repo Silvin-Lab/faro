@@ -265,7 +265,9 @@ func (s *store) expensesReport(ctx context.Context, tenantID string, from, to ti
 		return ExpensesReport{}, err
 	}
 
-	// Por sucursal (expenses.branch_id es NOT NULL; LEFT JOIN por robustez).
+	// Por sucursal. Desde 0021 expenses.branch_id puede ser NULL (gasto "General",
+	// corporativo, registrado por la administración central); ese bucket se etiqueta
+	// "General". LEFT JOIN por robustez.
 	brCond, brArgs := branchClause("e.", 4, branch)
 	brRows, err := s.pool.Query(ctx,
 		`SELECT e.branch_id::text, b.name, COUNT(*), COALESCE(SUM(e.amount_cents), 0)
@@ -286,7 +288,7 @@ func (s *store) expensesReport(ctx context.Context, tenantID string, from, to ti
 			return ExpensesReport{}, err
 		}
 		if b.BranchID == nil || name == nil {
-			b.BranchName = "Sin sucursal"
+			b.BranchName = "General"
 		} else {
 			b.BranchName = *name
 		}

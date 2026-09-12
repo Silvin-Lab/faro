@@ -10,15 +10,30 @@ import (
 	"faro/internal/auth"
 )
 
-// Routes se monta en /branches. Solo super admin (matriz §7): se monta con
-// requireSuperAdmin. El tenant se resuelve con ResolveTenant (businessTenantID).
-func (svc *Service) Routes(requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
+// Routes se monta en /branches. El módulo es de super_admin salvo UNA excepción:
+// GET /branches (listado) también lo lee el repostero, que necesita el filtro por
+// sucursal en su pantalla de tendencia de postres. Mismo patrón que warehouse.Routes:
+//   - un grupo bajo requireSession con GET / y autorización INLINE por rol
+//     (super_admin || repostero; si no => 403);
+//   - un grupo bajo requireSuperAdmin con TODO lo demás (POST/PATCH/DELETE).
+// El tenant se resuelve con ResolveTenant (businessTenantID).
+func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Use(requireSuperAdmin)
-	r.Get("/", svc.handleList)
-	r.Post("/", svc.handleCreate)
-	r.Patch("/{id}", svc.handleUpdate)
-	r.Delete("/{id}", svc.handleDelete)
+
+	// Listado abierto a repostero: sesión + gating inline.
+	r.Group(func(r chi.Router) {
+		r.Use(requireSession)
+		r.Get("/", svc.handleList)
+	})
+
+	// Todo lo demás sigue exclusivo de super_admin.
+	r.Group(func(r chi.Router) {
+		r.Use(requireSuperAdmin)
+		r.Post("/", svc.handleCreate)
+		r.Patch("/{id}", svc.handleUpdate)
+		r.Delete("/{id}", svc.handleDelete)
+	})
+
 	return r
 }
 
@@ -27,6 +42,17 @@ func tenantOf(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 func (svc *Service) handleList(w http.ResponseWriter, r *http.Request) {
+	// Autorización inline: solo super_admin y repostero. El resto de /branches
+	// sigue bajo requireSuperAdmin en el router.
+	u, okU := auth.UserFromContext(r.Context())
+	if !okU {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
+	if !u.IsSuperAdmin && u.Role != auth.RoleRepostero {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ver las sucursales")
+		return
+	}
 	tenantID, ok := tenantOf(w, r)
 	if !ok {
 		return

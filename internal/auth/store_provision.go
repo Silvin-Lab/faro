@@ -99,6 +99,40 @@ func (s *store) createSuperAdminUser(ctx context.Context, email, name, hash stri
 	return u, err
 }
 
+// createReposteroUser inserta un repostero (M10, F20/F21): tenant_id del negocio,
+// role='repostero', is_super_admin=false y SIN membresías de sucursal (nunca tiene
+// sucursal). Análogo a createSuperAdminUser pero tenant-scoped. Mapea la colisión de
+// email a ErrEmailTaken.
+func (s *store) createReposteroUser(ctx context.Context, tenantID, email, name, hash string) (User, error) {
+	var u User
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO users (tenant_id, email, password_hash, name, role, is_super_admin)
+		 VALUES ($1, $2, $3, $4, 'repostero', false)
+		 RETURNING id::text, tenant_id::text, email, name, role, is_super_admin, status, created_at`,
+		tenantID, email, hash, name).
+		Scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.Role, &u.IsSuperAdmin, &u.Status, &u.CreatedAt)
+	if isUniqueViolation(err) {
+		return User{}, ErrEmailTaken
+	}
+	return u, err
+}
+
+// roleOfUser devuelve el rol actual de un usuario del negocio (tenant-scoped). Se usa
+// para blindar invariantes de rol en UpdateUser (R4: repostero sin sucursal). uuid mal
+// formado / ajeno => ErrNotFound.
+func (s *store) roleOfUser(ctx context.Context, tenantID, id string) (string, error) {
+	var role string
+	err := s.pool.QueryRow(ctx,
+		`SELECT role FROM users WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&role)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), dberr.IsInvalidText(err):
+		return "", ErrNotFound
+	case err != nil:
+		return "", err
+	}
+	return role, nil
+}
+
 // updateUser aplica el patch (name y/o membresías) a un usuario del negocio y
 // devuelve el usuario actualizado con sus branches.
 func (s *store) updateUser(ctx context.Context, tenantID, id string, patch UserPatch) (User, error) {

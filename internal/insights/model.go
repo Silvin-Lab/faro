@@ -202,3 +202,38 @@ type LoyaltyEffectInsight struct {
 	Redeemed    LoyaltySegment `json:"redeemed"`
 	NotRedeemed LoyaltySegment `json:"notRedeemed"`
 }
+
+// ---- Tendencia de venta de postres (M10, F18/F19) --------------------------
+
+// BakeryScope es el alcance del insight de repostería: tenant, offset horario (tz, en
+// minutos) y filtro por sucursal. A diferencia de Scope no lleva rango: las dos ventanas
+// (semana en curso vs. anterior) las calcula el service.
+type BakeryScope struct {
+	TenantID string
+	TZ       int
+	Branch   BranchFilter
+}
+
+// WeekRange es una ventana semanal [From, To) en UTC (los instantes usados en la query).
+type WeekRange struct {
+	From time.Time `json:"from"`
+	To   time.Time `json:"to"`
+}
+
+// BakeryTrendItem compara la venta de un postre entre la semana anterior y la actual.
+// DeltaPct es null cuando UnitsPrevious=0 (guarda de división, patrón insights).
+type BakeryTrendItem struct {
+	ProductName   string   `json:"productName"`
+	UnitsPrevious int      `json:"unitsPrevious"`
+	UnitsCurrent  int      `json:"unitsCurrent"`
+	DeltaUnits    int      `json:"deltaUnits"`
+	DeltaPct      *float64 `json:"deltaPct"`
+}
+
+// BakeryTrendInsight es la respuesta de /insights/bakery-trend (agregación SQL pura, sin
+// IA, ADR-009). Orden: deltaUnits DESC (qué reforzar = lo que más creció en volumen).
+type BakeryTrendInsight struct {
+	WeekCurrent  WeekRange         `json:"weekCurrent"`
+	WeekPrevious WeekRange         `json:"weekPrevious"`
+	Items        []BakeryTrendItem `json:"items"`
+}

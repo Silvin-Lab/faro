@@ -29,11 +29,13 @@ type Concept struct {
 }
 
 // Expense es un gasto registrado. concept_name es un snapshot (patrón
-// sale_items.name): sobrevive a cambios/borrado del concepto.
+// sale_items.name): sobrevive a cambios/borrado del concepto. BranchID nil = gasto
+// "General" (corporativo, sin sucursal), registrable solo por la administración
+// central (super_admin); ver migración 0021.
 type Expense struct {
 	ID            string    `json:"id"`
 	TenantID      string    `json:"tenantId"`
-	BranchID      string    `json:"branchId"`
+	BranchID      *string   `json:"branchId"`
 	BranchName    *string   `json:"branchName"`
 	ConceptID     *string   `json:"conceptId"`
 	ConceptName   string    `json:"conceptName"`

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"faro/internal/auth"
+	"faro/internal/bakery"
 	"faro/internal/branches"
 	"faro/internal/categories"
 	"faro/internal/customers"
@@ -29,7 +30,7 @@ import (
 // New construye el handler HTTP raíz. Los módulos (auth, products, …) montarán
 // aquí sus sub-routers en incrementos siguientes. corsOrigin es el origen del
 // frontend (faro-ui) autorizado a consumir la API con credenciales.
-func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, insightsSvc *insights.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
+func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, insightsSvc *insights.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, bakerySvc *bakery.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
@@ -82,8 +83,9 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 	r.Mount("/insights", insightsSvc.Routes(authSvc.RequireSession))
 	// Lealtad (M6 v2): lectura por sesión, CRUD de promociones solo super admin.
 	r.Mount("/loyalty", loyaltySvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
-	// Sucursales (M7): CRUD solo super admin.
-	r.Mount("/branches", branchesSvc.Routes(authSvc.RequireSuperAdmin))
+	// Sucursales (M7): CRUD solo super admin; GET /branches además lo lee el
+	// repostero (M10) con autorización inline; ver branches.Routes.
+	r.Mount("/branches", branchesSvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
 	// Ajustes del negocio (M7): favicon del tenant (solo super admin).
 	r.Mount("/settings", settingsSvc.Routes(authSvc.RequireSuperAdmin))
 	// Gastos: catálogo (lectura sesión, escritura super admin) y registro de gastos
@@ -93,8 +95,12 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 	// movimientos de inventario y recetas) solo super admin. Inventario por sucursal.
 	r.Mount("/supplies", suppliesSvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
 	// Almacén central (M8): existencias/mín-máx, proveedores, compras, salidas y
-	// mermas. TODO el módulo (lectura y escritura) está gated a super admin.
-	r.Mount("/warehouse", warehouseSvc.Routes(authSvc.RequireSuperAdmin))
+	// mermas. Gated a super admin salvo GET /stock, abierto también a repostero (M10
+	// F17) con autorización inline; ver warehouse.Routes.
+	r.Mount("/warehouse", warehouseSvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
+	// Repostería / producción central (M10): pedidos de sucursal, producción (doble
+	// efecto de stock), stock de postre y auditoría. Autorización inline por rol.
+	r.Mount("/bakery", bakerySvc.Routes(authSvc.RequireSession))
 	// Subida de imágenes (POST, solo super admin) y servir archivos estáticos (público).
 	r.Mount("/uploads", uploadsH.Routes())
 	r.Handle("/files/*", http.StripPrefix("/files/", http.FileServer(http.Dir(uploadDir))))

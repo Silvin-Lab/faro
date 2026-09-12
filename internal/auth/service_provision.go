@@ -69,6 +69,14 @@ func (svc *Service) CreateUser(ctx context.Context, tenantID, email, password, n
 		}
 		return svc.store.createSuperAdminUser(ctx, email, name, hash)
 	}
+	if role == RoleRepostero {
+		// Repostero (M10, F21): tenant-scoped SIN sucursal. NO admite membresías (si
+		// trae alguna => ErrValidation) y se crea con el tenant del negocio.
+		if len(branchIDs) != 0 {
+			return User{}, ErrValidation
+		}
+		return svc.store.createReposteroUser(ctx, tenantID, email, name, hash)
+	}
 	// Roles de sucursal: exigen ≥1 sucursal del negocio.
 	if len(branchIDs) == 0 {
 		return User{}, ErrValidation
@@ -88,6 +96,20 @@ func (svc *Service) UpdateUser(ctx context.Context, tenantID, id string, patch U
 			return User{}, ErrValidation
 		}
 		patch.Name = &n
+	}
+	// Blindaje del invariante "repostero sin sucursal" (R4, F21): si el usuario objetivo
+	// es repostero, NO se le puede asignar sucursal ni cambiarle el rol por esta vía. Se
+	// carga el rol actual solo cuando el patch podría violarlo (role o branchIDs). El guard
+	// de patch.Role de abajo ya impide PROMOVER a repostero (solo isBranchRole pasa); esto
+	// cubre el lado que faltaba: no colgarle una sucursal ni degradarlo a rol de sucursal.
+	if patch.Role != nil || patch.BranchIDs != nil {
+		current, err := svc.store.roleOfUser(ctx, tenantID, id)
+		if err != nil {
+			return User{}, err
+		}
+		if current == RoleRepostero {
+			return User{}, ErrValidation
+		}
 	}
 	if patch.Role != nil {
 		r := strings.TrimSpace(*patch.Role)

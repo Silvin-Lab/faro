@@ -3,6 +3,7 @@ package insights
 import (
 	"context"
 	"math"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -99,6 +100,56 @@ func (svc *Service) LoyaltyEffect(ctx context.Context, sc Scope) (LoyaltyEffectI
 		}
 	}
 	return out, nil
+}
+
+// BakeryTrend (M10, F18/F19): compara la venta de postres de la semana en curso vs. la
+// anterior. Calcula las dos ventanas semanales (lunes 00:00 local a lunes) con el offset
+// horario del cliente (tz en minutos), delega la agregación al store (SQL puro) y deriva
+// deltaUnits/deltaPct en Go con guarda de división. Orden: deltaUnits DESC (viene del SQL).
+func (svc *Service) BakeryTrend(ctx context.Context, sc BakeryScope) (BakeryTrendInsight, error) {
+	curFrom, curTo := currentWeek(time.Now(), sc.TZ)
+	prevFrom := curFrom.AddDate(0, 0, -7)
+
+	rows, err := svc.store.bakeryTrend(ctx, sc.TenantID, prevFrom, curFrom, curTo, sc.Branch)
+	if err != nil {
+		return BakeryTrendInsight{}, err
+	}
+	out := BakeryTrendInsight{
+		WeekCurrent:  WeekRange{From: curFrom, To: curTo},
+		WeekPrevious: WeekRange{From: prevFrom, To: curFrom},
+		Items:        []BakeryTrendItem{},
+	}
+	for _, r := range rows {
+		it := BakeryTrendItem{
+			ProductName:   r.Name,
+			UnitsPrevious: r.UnitsPrevious,
+			UnitsCurrent:  r.UnitsCurrent,
+			DeltaUnits:    r.UnitsCurrent - r.UnitsPrevious,
+		}
+		if r.UnitsPrevious != 0 {
+			d := round2(float64(r.UnitsCurrent-r.UnitsPrevious) / float64(r.UnitsPrevious) * 100)
+			it.DeltaPct = &d
+		}
+		out.Items = append(out.Items, it)
+	}
+	return out, nil
+}
+
+// currentWeek devuelve la ventana [from,to) de la semana en curso (lunes 00:00 a lunes
+// siguiente) en UTC, calculada en la hora local del cliente (offset tz en minutos). Los
+// límites se devuelven como instantes UTC (los que usa la query sobre sales.created_at,
+// almacenado en UTC).
+func currentWeek(now time.Time, tzMinutes int) (from, to time.Time) {
+	offset := time.Duration(tzMinutes) * time.Minute
+	local := now.UTC().Add(offset)
+	// Días transcurridos desde el lunes (Go: Sunday=0 ... Saturday=6).
+	daysSinceMonday := (int(local.Weekday()) + 6) % 7
+	startLocal := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC).
+		AddDate(0, 0, -daysSinceMonday)
+	// Convertir el inicio local a instante UTC restando el offset.
+	from = startLocal.Add(-offset)
+	to = from.AddDate(0, 0, 7)
+	return from, to
 }
 
 // ---- Helpers de aritmética con guarda de división por cero ----------------

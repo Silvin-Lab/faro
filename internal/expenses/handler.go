@@ -221,14 +221,15 @@ func (svc *Service) handleUpdateConcept(w http.ResponseWriter, r *http.Request) 
 // ---- Gastos ----------------------------------------------------------------
 
 type createExpenseRequest struct {
-	ConceptID   string `json:"conceptId"`
-	AmountCents int    `json:"amountCents"`
+	ConceptID   string  `json:"conceptId"`
+	AmountCents int     `json:"amountCents"`
+	BranchID    *string `json:"branchId"`
 }
 
 func (svc *Service) handleCreateExpense(w http.ResponseWriter, r *http.Request) {
-	// Solo personal de sucursal registra gastos: el super admin global (sin tenant)
-	// no opera este flujo (patrón sales/handler.go).
-	tenantID, ok := auth.TenantOf(w, r)
+	// ResolveTenant (no TenantOf) para que la administración central (super_admin, sin
+	// tenant propio) resuelva el tenant del negocio único y pueda registrar gastos.
+	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}
@@ -237,21 +238,36 @@ func (svc *Service) handleCreateExpense(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
 		return
 	}
-	branchID, ok := activeBranch(w, r)
-	if !ok {
-		return
-	}
 	var req createExpenseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
 		return
 	}
+
+	// Resolución del branch a registrar según rol:
+	//   super_admin: usa req.BranchID tal cual (nil/ausente = gasto "General" sin
+	//     sucursal; con valor = esa sucursal, que el service valida del tenant).
+	//   usuario de sucursal: SIEMPRE su sucursal activa; el req.BranchID del body se
+	//     ignora (no puede inyectar una sucursal distinta a la suya).
+	var branchID *string
+	if u.IsSuperAdmin {
+		branchID = req.BranchID
+	} else {
+		active, okB := activeBranch(w, r)
+		if !okB {
+			return
+		}
+		branchID = &active
+	}
+
 	e, err := svc.CreateExpense(r.Context(), tenantID, branchID, req.ConceptID, req.AmountCents, u.ID)
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "El monto debe ser mayor a cero")
 	case errors.Is(err, ErrInvalidConcept):
 		writeError(w, http.StatusBadRequest, "invalid_concept", "El concepto no es válido o está inactivo")
+	case errors.Is(err, ErrInvalidBranch):
+		writeError(w, http.StatusBadRequest, "invalid_branch", "La sucursal no es válida")
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo registrar el gasto")
 	default:
@@ -330,7 +346,10 @@ func (svc *Service) handleDeleteExpense(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusBadRequest, "branch_required", "Debes seleccionar una sucursal")
 			return
 		}
-		if branchID != *active {
+		// branchID nil = gasto "General" (sin sucursal): nunca coincide con la sucursal
+		// activa, así que solo el super_admin puede borrarlo (igual que un gasto de otra
+		// sucursal).
+		if branchID == nil || *branchID != *active {
 			writeError(w, http.StatusForbidden, "forbidden", "No puedes borrar gastos de otra sucursal")
 			return
 		}

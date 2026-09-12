@@ -3,6 +3,7 @@ package insights
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -632,4 +633,49 @@ func (s *store) loyaltyEffect(ctx context.Context, sc Scope) ([]loyaltyRawSegmen
 		segs = append(segs, seg)
 	}
 	return segs, rows.Err()
+}
+
+// ---- Tendencia de venta de postres (M10, F18/F19) --------------------------
+
+// bakeryTrendRow es una fila cruda: unidades vendidas de un postre en cada ventana.
+type bakeryTrendRow struct {
+	Name          string
+	UnitsPrevious int
+	UnitsCurrent  int
+}
+
+// bakeryTrend agrega, por postre (products.fulfillment_type='bakery'), las unidades
+// vendidas en la ventana anterior [prevFrom,prevTo) y en la actual [curFrom,curTo). Las
+// dos ventanas son contiguas (prevTo == curFrom), así que el WHERE cubre [prevFrom,curTo).
+// Solo aparecen postres con venta en alguna de las dos semanas (JOIN por sale_items).
+// Orden: mayor crecimiento en volumen primero (deltaUnits DESC). SQL puro, sin IA.
+func (s *store) bakeryTrend(ctx context.Context, tenantID string, prevFrom, curFrom, curTo time.Time, f BranchFilter) ([]bakeryTrendRow, error) {
+	bc, bArgs := branchClause("s.", 5, f)
+	args := append([]any{tenantID, prevFrom, curFrom, curTo}, bArgs...)
+	rows, err := s.pool.Query(ctx, `
+		SELECT p.name,
+		       COALESCE(SUM(si.quantity) FILTER (WHERE s.created_at >= $2 AND s.created_at < $3), 0)::int AS units_prev,
+		       COALESCE(SUM(si.quantity) FILTER (WHERE s.created_at >= $3 AND s.created_at < $4), 0)::int AS units_cur
+		  FROM sale_items si
+		  JOIN sales s ON s.id = si.sale_id
+		  JOIN products p ON p.id = si.product_id AND p.tenant_id = $1 AND p.fulfillment_type = 'bakery'
+		 WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $4`+bc+`
+		 GROUP BY p.id, p.name
+		 ORDER BY (COALESCE(SUM(si.quantity) FILTER (WHERE s.created_at >= $3 AND s.created_at < $4), 0)
+		           - COALESCE(SUM(si.quantity) FILTER (WHERE s.created_at >= $2 AND s.created_at < $3), 0)) DESC,
+		          p.name`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []bakeryTrendRow{}
+	for rows.Next() {
+		var row bakeryTrendRow
+		if err := rows.Scan(&row.Name, &row.UnitsPrevious, &row.UnitsCurrent); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
