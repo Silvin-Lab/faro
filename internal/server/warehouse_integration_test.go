@@ -53,8 +53,9 @@ func TestWarehouseGating(t *testing.T) {
 		{http.MethodGet, "/warehouse/purchases", nil},
 		{http.MethodPost, "/warehouse/dispatches", map[string]any{"supplyId": "x", "branchId": "y", "quantityBase": 1}},
 		{http.MethodGet, "/warehouse/dispatches", nil},
-		{http.MethodPost, "/warehouse/waste", map[string]any{"supplyId": "x", "quantityBase": 1, "reason": "r"}},
-		{http.MethodGet, "/warehouse/waste", nil},
+		// NOTA (M11): POST/GET /warehouse/waste YA NO son 403 para roles de sucursal
+		// (la merma de sucursal se abrió a cashier/barista/branch_admin con gating inline
+		// que fuerza su sucursal activa). Su regresión vive en TestWarehouseWasteRoles.
 	}
 	for _, r := range routes {
 		resp := env.do(t, cashier, r.method, r.path, r.body)

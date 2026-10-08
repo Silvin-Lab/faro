@@ -359,6 +359,150 @@ func TestDispatch(t *testing.T) {
 	}
 }
 
+// ---- M11: surtido de requisición vía dispatch ------------------------------
+
+// TestDispatchFulfillsRequisition verifica que un dispatch con requisitionItemId acumula
+// quantity_fulfilled en la línea, liga el movimiento (warehouse_movements.requisition_id),
+// y recalcula el estado de la requisición (partial -> fulfilled); un requisitionItemId con
+// supply_id que no coincide da ErrInvalidRequisitionItem sin tocar nada.
+func TestDispatchFulfillsRequisition(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	// Un segundo insumo del tenant A para la línea que quedará pendiente.
+	var supplyA2 string
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supplies (tenant_id, name, base_unit, package_name, package_content)
+		 VALUES ($1,'InsumoA2','g','Bolsa 100',100) RETURNING id::text`, f.tenantA).Scan(&supplyA2)
+
+	// Requisición de branchA1 con 2 líneas: supplyA (pide 100), supplyA2 (pide 50).
+	var reqID, itemA, itemA2 string
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supply_requisitions (tenant_id, branch_id) VALUES ($1,$2) RETURNING id::text`,
+		f.tenantA, f.branchA1).Scan(&reqID)
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supply_requisition_items (tenant_id, requisition_id, supply_id, quantity_requested)
+		 VALUES ($1,$2,$3,100) RETURNING id::text`, f.tenantA, reqID, f.supplyA).Scan(&itemA)
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supply_requisition_items (tenant_id, requisition_id, supply_id, quantity_requested)
+		 VALUES ($1,$2,$3,50) RETURNING id::text`, f.tenantA, reqID, supplyA2).Scan(&itemA2)
+
+	// Mismatch: itemA es de supplyA; despachar supplyA2 contra itemA => ErrInvalidRequisitionItem.
+	if _, _, _, err := f.svc.CreateDispatch(ctx, f.tenantA, DispatchInput{
+		SupplyID: supplyA2, BranchID: f.branchA1, QuantityBase: 10, RequisitionItemID: &itemA,
+	}, f.userA); !errors.Is(err, ErrInvalidRequisitionItem) {
+		t.Fatalf("supply mismatch: esperaba ErrInvalidRequisitionItem, obtuvo %v", err)
+	}
+
+	// Dispatch parcial de itemA (60 de 100): requisición pasa a 'partial'.
+	m, _, _, err := f.svc.CreateDispatch(ctx, f.tenantA, DispatchInput{
+		SupplyID: f.supplyA, BranchID: f.branchA1, QuantityBase: 60, RequisitionItemID: &itemA,
+	}, f.userA)
+	if err != nil {
+		t.Fatalf("dispatch parcial: %v", err)
+	}
+	var linkedReq *string
+	f.pool.QueryRow(ctx, `SELECT requisition_id::text FROM warehouse_movements WHERE id=$1`, m.ID).Scan(&linkedReq)
+	if linkedReq == nil || *linkedReq != reqID {
+		t.Fatalf("dispatch no ligó la requisición: %v", linkedReq)
+	}
+	assertReqItem(t, f, itemA, 60)
+	assertReqStatus(t, f, reqID, "partial")
+
+	// Dispatch que completa itemA (40 más => 100) pero itemA2 sigue en 0: sigue 'partial'.
+	if _, _, _, err := f.svc.CreateDispatch(ctx, f.tenantA, DispatchInput{
+		SupplyID: f.supplyA, BranchID: f.branchA1, QuantityBase: 40, RequisitionItemID: &itemA,
+	}, f.userA); err != nil {
+		t.Fatalf("dispatch completa itemA: %v", err)
+	}
+	assertReqItem(t, f, itemA, 100)
+	assertReqStatus(t, f, reqID, "partial")
+
+	// Surtir itemA2 completo (50): TODAS las líneas completas => 'fulfilled'.
+	if _, _, _, err := f.svc.CreateDispatch(ctx, f.tenantA, DispatchInput{
+		SupplyID: supplyA2, BranchID: f.branchA1, QuantityBase: 50, RequisitionItemID: &itemA2,
+	}, f.userA); err != nil {
+		t.Fatalf("dispatch completa itemA2: %v", err)
+	}
+	assertReqItem(t, f, itemA2, 50)
+	assertReqStatus(t, f, reqID, "fulfilled")
+}
+
+func assertReqItem(t *testing.T, f *fixture, itemID string, wantFulfilled int) {
+	t.Helper()
+	var got int
+	f.pool.QueryRow(context.Background(),
+		`SELECT quantity_fulfilled FROM supply_requisition_items WHERE id=$1`, itemID).Scan(&got)
+	if got != wantFulfilled {
+		t.Fatalf("quantity_fulfilled de %s: esperaba %d, obtuvo %d", itemID, wantFulfilled, got)
+	}
+}
+
+func assertReqStatus(t *testing.T, f *fixture, reqID, want string) {
+	t.Helper()
+	var got string
+	f.pool.QueryRow(context.Background(),
+		`SELECT status FROM supply_requisitions WHERE id=$1`, reqID).Scan(&got)
+	if got != want {
+		t.Fatalf("status de requisición: esperaba %q, obtuvo %q", want, got)
+	}
+}
+
+// TestDispatchRequisitionConcurrency: dos dispatches SIMULTÁNEOS que surten las dos únicas
+// líneas pendientes de la MISMA requisición deben dejarla en 'fulfilled' (no atascada en
+// 'partial'). Sin el lock de la fila padre, bajo READ COMMITTED ambos recálculos de status
+// verían un snapshot viejo y podrían escribir 'partial'.
+func TestDispatchRequisitionConcurrency(t *testing.T) {
+	f := setup(t)
+	defer f.pool.Close()
+	ctx := context.Background()
+
+	var supplyA2 string
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supplies (tenant_id, name, base_unit, package_name, package_content)
+		 VALUES ($1,'InsumoA2','g','Bolsa 100',100) RETURNING id::text`, f.tenantA).Scan(&supplyA2)
+
+	var reqID, itemA, itemA2 string
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supply_requisitions (tenant_id, branch_id) VALUES ($1,$2) RETURNING id::text`,
+		f.tenantA, f.branchA1).Scan(&reqID)
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supply_requisition_items (tenant_id, requisition_id, supply_id, quantity_requested)
+		 VALUES ($1,$2,$3,100) RETURNING id::text`, f.tenantA, reqID, f.supplyA).Scan(&itemA)
+	f.pool.QueryRow(ctx,
+		`INSERT INTO supply_requisition_items (tenant_id, requisition_id, supply_id, quantity_requested)
+		 VALUES ($1,$2,$3,50) RETURNING id::text`, f.tenantA, reqID, supplyA2).Scan(&itemA2)
+
+	// Repetimos varias veces para exponer la carrera de forma más fiable.
+	for iter := 0; iter < 5; iter++ {
+		// Reset: ambas líneas a 0 y requisición a pending.
+		f.pool.Exec(ctx, `UPDATE supply_requisition_items SET quantity_fulfilled=0 WHERE requisition_id=$1`, reqID)
+		f.pool.Exec(ctx, `UPDATE supply_requisitions SET status='pending' WHERE id=$1`, reqID)
+
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		dispatch := func(supplyID, itemID string, qty int) {
+			defer wg.Done()
+			_, _, _, err := f.svc.CreateDispatch(ctx, f.tenantA, DispatchInput{
+				SupplyID: supplyID, BranchID: f.branchA1, QuantityBase: qty, RequisitionItemID: &itemID,
+			}, f.userA)
+			errs <- err
+		}
+		wg.Add(2)
+		go dispatch(f.supplyA, itemA, 100)
+		go dispatch(supplyA2, itemA2, 50)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("iter %d: dispatch concurrente falló: %v", iter, err)
+			}
+		}
+		assertReqStatus(t, f, reqID, "fulfilled")
+	}
+}
+
 // ---- B7 + regresión 100/10 galletas ----------------------------------------
 
 // TestWasteBifurcationAndRegression cubre la bifurcación de merma (§3.3) y el
@@ -427,12 +571,22 @@ func TestWasteBifurcationAndRegression(t *testing.T) {
 	}
 
 	// Historial de mermas = UNION (1 branch + 1 warehouse), ordenado por fecha DESC.
-	waste, err := f.svc.ListWaste(ctx, f.tenantA, nil, nil)
+	waste, err := f.svc.ListWaste(ctx, f.tenantA, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("listWaste: %v", err)
 	}
 	if len(waste) != 2 {
 		t.Fatalf("historial mermas: esperaba 2 (UNION), obtuvo %d", len(waste))
+	}
+
+	// Con scope de sucursal (branchA1): solo la merma de esa sucursal (1), NUNCA la del
+	// almacén central (M11: personal de sucursal solo ve lo suyo).
+	scoped, err := f.svc.ListWaste(ctx, f.tenantA, nil, nil, &f.branchA1)
+	if err != nil {
+		t.Fatalf("listWaste scope: %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].Origin != "branch" {
+		t.Fatalf("listWaste scope sucursal: esperaba 1 fila origin=branch, obtuvo %+v", scoped)
 	}
 	origins := map[string]bool{}
 	for _, w := range waste {

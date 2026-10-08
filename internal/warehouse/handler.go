@@ -17,15 +17,21 @@ import (
 //   - un grupo bajo requireSession con GET /stock y autorización INLINE por rol
 //     (super_admin || repostero; si no => 403);
 //   - un grupo bajo requireSuperAdmin con TODO lo demás (escritura + resto de lectura).
+//
 // Regresión (§8): branch_admin/cashier/barista => 403 en TODO /warehouse; repostero =>
 // 403 en todo /warehouse EXCEPTO GET /stock.
 func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
 
-	// Lectura de existencias abierta a repostero (F17): sesión + gating inline.
+	// Lectura de existencias abierta a repostero (F17) y merma abierta a sucursal
+	// (M11): sesión + gating INLINE por rol en cada handler.
 	r.Group(func(r chi.Router) {
 		r.Use(requireSession)
 		r.Get("/stock", svc.handleListStock)
+		// Mermas: super_admin (almacén o cualquier sucursal) y roles de sucursal (su
+		// propia sucursal, forzada). repostero => 403 (gating inline).
+		r.Post("/waste", svc.handleCreateWaste)
+		r.Get("/waste", svc.handleListWaste)
 	})
 
 	// Todo lo demás sigue exclusivo de super_admin.
@@ -49,10 +55,6 @@ func (svc *Service) Routes(requireSession, requireSuperAdmin func(http.Handler) 
 		// Salidas.
 		r.Post("/dispatches", svc.handleCreateDispatch)
 		r.Get("/dispatches", svc.handleListDispatches)
-
-		// Mermas.
-		r.Post("/waste", svc.handleCreateWaste)
-		r.Get("/waste", svc.handleListWaste)
 	})
 
 	return r
@@ -352,10 +354,11 @@ func (svc *Service) handleListPurchases(w http.ResponseWriter, r *http.Request) 
 // ---- Salidas ---------------------------------------------------------------
 
 type dispatchRequest struct {
-	SupplyID     string `json:"supplyId"`
-	BranchID     string `json:"branchId"`
-	QuantityBase int    `json:"quantityBase"`
-	Date         string `json:"date"`
+	SupplyID          string  `json:"supplyId"`
+	BranchID          string  `json:"branchId"`
+	QuantityBase      int     `json:"quantityBase"`
+	Date              string  `json:"date"`
+	RequisitionItemID *string `json:"requisitionItemId"`
 }
 
 func (svc *Service) handleCreateDispatch(w http.ResponseWriter, r *http.Request) {
@@ -375,6 +378,7 @@ func (svc *Service) handleCreateDispatch(w http.ResponseWriter, r *http.Request)
 	}
 	m, whStock, branchStock, err := svc.CreateDispatch(r.Context(), tenantID, DispatchInput{
 		SupplyID: req.SupplyID, BranchID: req.BranchID, QuantityBase: req.QuantityBase, Date: req.Date,
+		RequisitionItemID: req.RequisitionItemID,
 	}, u.ID)
 	switch {
 	case errors.Is(err, ErrValidation):
@@ -383,6 +387,8 @@ func (svc *Service) handleCreateDispatch(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid_supply", "El insumo no es válido")
 	case errors.Is(err, ErrInvalidBranch):
 		writeError(w, http.StatusBadRequest, "invalid_branch", "La sucursal no es válida")
+	case errors.Is(err, ErrInvalidRequisitionItem):
+		writeError(w, http.StatusBadRequest, "invalid_requisition_item", "La línea de requisición no corresponde a este insumo")
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo registrar la salida")
 	default:
@@ -430,10 +436,30 @@ func (svc *Service) handleCreateWaste(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
 		return
 	}
+	// Gating inline por rol (M11): super_admin sin restricción (branchId del body o nil
+	// para almacén central); rol de sucursal SOBRESCRIBE branchId con su sucursal activa
+	// (nunca otra, nunca el almacén central); repostero u otro => 403.
+	if u.IsSuperAdmin {
+		// Sin restricción: se respeta el branchId del body (o nil).
+	} else if isBranchRole(u) {
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		if active == nil || *active == "" {
+			writeError(w, http.StatusBadRequest, "branch_required", "Selecciona una sucursal activa")
+			return
+		}
+		// Se ignora cualquier branchId del body y se fuerza la sucursal activa.
+	} else {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para registrar mermas")
+		return
+	}
 	var req wasteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
 		return
+	}
+	if !u.IsSuperAdmin {
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		req.BranchID = active
 	}
 	m, stockBase, err := svc.CreateWaste(r.Context(), tenantID, WasteInput{
 		SupplyID: req.SupplyID, QuantityBase: req.QuantityBase, Reason: req.Reason,
@@ -454,13 +480,34 @@ func (svc *Service) handleCreateWaste(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleListWaste(w http.ResponseWriter, r *http.Request) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
 	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
 	}
+	// Gating + scope inline (M11): super_admin ve todo; rol de sucursal forzado a la suya
+	// (solo mermas de esa sucursal, nunca las del almacén central); repostero u otro => 403.
+	var branchScope *string
+	if u.IsSuperAdmin {
+		// Sin scope: ve almacén + todas las sucursales.
+	} else if isBranchRole(u) {
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		if active == nil || *active == "" {
+			writeError(w, http.StatusBadRequest, "branch_required", "Selecciona una sucursal activa")
+			return
+		}
+		branchScope = active
+	} else {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ver mermas")
+		return
+	}
 	from := parseTime(r.URL.Query().Get("from"))
 	to := parseTime(r.URL.Query().Get("to"))
-	items, err := svc.ListWaste(r.Context(), tenantID, from, to)
+	items, err := svc.ListWaste(r.Context(), tenantID, from, to, branchScope)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar las mermas")
 		return
@@ -469,6 +516,12 @@ func (svc *Service) handleListWaste(w http.ResponseWriter, r *http.Request) {
 		items = []WasteItem{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// isBranchRole indica si el usuario es personal de sucursal (branch_admin/cashier/barista):
+// tiene una sucursal activa a nombre de la cual opera.
+func isBranchRole(u auth.User) bool {
+	return u.Role == auth.RoleBranchAdmin || u.Role == auth.RoleCashier || u.Role == auth.RoleBarista
 }
 
 // ---- Helpers ---------------------------------------------------------------

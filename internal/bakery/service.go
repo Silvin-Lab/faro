@@ -2,6 +2,7 @@ package bakery
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,6 +82,99 @@ func (svc *Service) ListStock(ctx context.Context, tenantID string, branchID *st
 
 func (svc *Service) ListProductions(ctx context.Context, tenantID string, from, to *time.Time, branchID, productID *string) ([]ProductionAudit, error) {
 	return svc.store.listProductions(ctx, tenantID, from, to, branchID, productID)
+}
+
+// ---- Merma de postre -------------------------------------------------------
+
+// CreateWaste valida (cantidad > 0, motivo requerido, sucursal del negocio) y registra
+// una merma de postre. El producto se revalida bakery+activo dentro de la transacción del
+// store. branchID = sucursal efectiva resuelta por el handler (activa o del body si
+// super_admin). quantity se guarda como negativo.
+func (svc *Service) CreateWaste(ctx context.Context, tenantID, branchID, productID string, quantity int, reason string, createdBy string) (WasteMovement, error) {
+	branchID = strings.TrimSpace(branchID)
+	productID = strings.TrimSpace(productID)
+	reason = strings.TrimSpace(reason)
+	if quantity <= 0 || reason == "" {
+		return WasteMovement{}, ErrValidation
+	}
+	if branchID == "" {
+		return WasteMovement{}, ErrInvalidBranch
+	}
+	okBranch, err := svc.store.branchInTenant(ctx, tenantID, branchID)
+	if err != nil {
+		return WasteMovement{}, err
+	}
+	if !okBranch {
+		return WasteMovement{}, ErrInvalidBranch
+	}
+	return svc.store.insertWaste(ctx, tenantID, productID, branchID, quantity, reason, createdBy)
+}
+
+func (svc *Service) ListWaste(ctx context.Context, tenantID string, from, to *time.Time, branchID *string) ([]WasteAudit, error) {
+	return svc.store.listWaste(ctx, tenantID, from, to, branchID)
+}
+
+// ---- Conteo de cierre de postres -------------------------------------------
+
+// countLine es una línea de conteo ya validada (con nombre resuelto), lista para el store.
+type countLine struct {
+	ProductID   string
+	ProductName string
+	CountedQty  int
+}
+
+// CreateCount valida (sucursal del negocio, al menos una línea, contado >= 0, productos
+// bakery+activos sin duplicados) y ejecuta la reconciliación del conteo. Ordena las líneas
+// por product_id ASC (orden de bloqueo determinista, anti-deadlock). branchID = sucursal
+// efectiva resuelta por el handler.
+func (svc *Service) CreateCount(ctx context.Context, tenantID, branchID string, note *string, items []CountLineInput, createdBy string) (CountDetail, error) {
+	branchID = strings.TrimSpace(branchID)
+	if branchID == "" {
+		return CountDetail{}, ErrInvalidBranch
+	}
+	if len(items) == 0 {
+		return CountDetail{}, ErrValidation
+	}
+	okBranch, err := svc.store.branchInTenant(ctx, tenantID, branchID)
+	if err != nil {
+		return CountDetail{}, err
+	}
+	if !okBranch {
+		return CountDetail{}, ErrInvalidBranch
+	}
+
+	seen := map[string]bool{}
+	lines := make([]countLine, 0, len(items))
+	for _, it := range items {
+		pid := strings.TrimSpace(it.ProductID)
+		if pid == "" || it.CountedQty < 0 {
+			return CountDetail{}, ErrValidation
+		}
+		if seen[pid] {
+			return CountDetail{}, ErrValidation
+		}
+		seen[pid] = true
+		name, err := svc.store.productBakeryName(ctx, tenantID, pid)
+		if err != nil {
+			return CountDetail{}, err
+		}
+		if name == "" {
+			return CountDetail{}, ErrInvalidProduct
+		}
+		lines = append(lines, countLine{ProductID: pid, ProductName: name, CountedQty: it.CountedQty})
+	}
+	// Orden de bloqueo determinista por product_id (anti-deadlock, mismo criterio que produce()).
+	sort.Slice(lines, func(i, j int) bool { return lines[i].ProductID < lines[j].ProductID })
+
+	return svc.store.createCount(ctx, tenantID, branchID, normalizeNote(note), lines, createdBy)
+}
+
+func (svc *Service) GetCount(ctx context.Context, tenantID, id string) (CountDetail, error) {
+	return svc.store.getCount(ctx, tenantID, id)
+}
+
+func (svc *Service) ListCounts(ctx context.Context, tenantID string, branchID *string, from, to *time.Time) ([]Count, error) {
+	return svc.store.listCounts(ctx, tenantID, branchID, from, to)
 }
 
 // normalizeNote recorta la nota; vacía => nil.

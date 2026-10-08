@@ -206,11 +206,14 @@ func (svc *Service) ListPurchases(ctx context.Context, tenantID string, from, to
 // ---- Salidas ---------------------------------------------------------------
 
 // DispatchInput es la petición de una salida. QuantityBase > 0 (unidad base).
+// RequisitionItemID opcional (M11): si viene, la salida surte esa línea de requisición
+// (actualiza quantity_fulfilled y liga el movimiento), dentro de la misma transacción.
 type DispatchInput struct {
-	SupplyID     string
-	BranchID     string
-	QuantityBase int
-	Date         string
+	SupplyID          string
+	BranchID          string
+	QuantityBase      int
+	Date              string
+	RequisitionItemID *string
 }
 
 func (svc *Service) CreateDispatch(ctx context.Context, tenantID string, in DispatchInput, createdBy string) (WarehouseMovement, int, int, error) {
@@ -235,8 +238,9 @@ func (svc *Service) CreateDispatch(ctx context.Context, tenantID string, in Disp
 	if !okBranch {
 		return WarehouseMovement{}, 0, 0, ErrInvalidBranch
 	}
+	reqItemID := normalize(in.RequisitionItemID)
 	createdAt := resolveCreatedAt(in.Date, svc.nowUTC())
-	return svc.store.insertDispatch(ctx, tenantID, in.SupplyID, branchID, in.QuantityBase, createdBy, createdAt)
+	return svc.store.insertDispatch(ctx, tenantID, in.SupplyID, branchID, in.QuantityBase, reqItemID, createdBy, createdAt)
 }
 
 func (svc *Service) ListDispatches(ctx context.Context, tenantID string, from, to *time.Time) ([]DispatchItem, error) {
@@ -291,8 +295,11 @@ func (svc *Service) CreateWaste(ctx context.Context, tenantID string, in WasteIn
 	return svc.store.insertWasteBranch(ctx, tenantID, in.SupplyID, *branchID, in.QuantityBase, reason, createdBy, createdAt)
 }
 
-func (svc *Service) ListWaste(ctx context.Context, tenantID string, from, to *time.Time) ([]WasteItem, error) {
-	return svc.store.listWaste(ctx, tenantID, from, to)
+// ListWaste lista el historial de mermas. branchScope != nil fuerza el scope a esa
+// sucursal (solo mermas de sucursal; excluye las del almacén central), para el personal de
+// sucursal (M11); nil = todo (almacén + todas las sucursales), para super_admin.
+func (svc *Service) ListWaste(ctx context.Context, tenantID string, from, to *time.Time, branchScope *string) ([]WasteItem, error) {
+	return svc.store.listWaste(ctx, tenantID, from, to, branchScope)
 }
 
 // ---- Helpers ---------------------------------------------------------------

@@ -18,11 +18,13 @@ import (
 	"faro/internal/branches"
 	"faro/internal/categories"
 	"faro/internal/customers"
+	"faro/internal/dayclose"
 	"faro/internal/expenses"
 	"faro/internal/insights"
 	"faro/internal/loyalty"
 	"faro/internal/products"
 	"faro/internal/reports"
+	"faro/internal/requisitions"
 	"faro/internal/sales"
 	"faro/internal/server"
 	"faro/internal/settings"
@@ -54,7 +56,7 @@ func setupM7(t *testing.T) *m7Env {
 		t.Skipf("DB de test no disponible: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		"TRUNCATE product_stock_movements, product_branch_stock, bakery_productions, bakery_orders, warehouse_movements, warehouse_stock, suppliers, supply_movements, supply_branch_stock, product_supplies, supply_measures, supplies, supply_categories, user_branches, loyalty_redemptions, loyalty_promotion_products, loyalty_promotions, sale_items, sales, customers, products, categories, branches, users, tenants RESTART IDENTITY CASCADE"); err != nil {
+		"TRUNCATE branch_day_closures, bakery_count_items, bakery_counts, supply_requisition_items, supply_requisitions, product_stock_movements, product_branch_stock, bakery_productions, bakery_orders, warehouse_movements, warehouse_stock, suppliers, supply_movements, supply_branch_stock, product_supplies, supply_measures, supplies, supply_categories, user_branches, loyalty_redemptions, loyalty_promotion_products, loyalty_promotions, sale_items, sales, customers, products, categories, branches, users, tenants RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -64,11 +66,13 @@ func setupM7(t *testing.T) *m7Env {
 	}
 	dir := t.TempDir()
 	uploadsH := uploads.New(dir, authSvc.RequireSuperAdmin)
+	reportsSvc := reports.NewService(pool)
 	handler := server.New(pool, "http://localhost:3000", authSvc,
 		categories.NewService(pool), products.NewService(pool), sales.NewService(pool),
-		customers.NewService(pool), reports.NewService(pool), insights.NewService(pool), loyalty.NewService(pool),
+		customers.NewService(pool), reportsSvc, insights.NewService(pool), loyalty.NewService(pool),
 		branches.NewService(pool), settings.NewService(pool), expenses.NewService(pool),
-		supplies.NewService(pool), warehouse.NewService(pool), bakery.NewService(pool), uploadsH, dir)
+		supplies.NewService(pool), warehouse.NewService(pool), bakery.NewService(pool),
+		requisitions.NewService(pool), dayclose.NewService(pool, reportsSvc), uploadsH, dir)
 
 	env := &m7Env{srv: httptest.NewServer(handler), pool: pool}
 

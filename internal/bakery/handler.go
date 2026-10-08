@@ -26,7 +26,227 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	r.Patch("/orders/{id}/receive", svc.handleReceive)
 	r.Get("/stock", svc.handleListStock)
 	r.Get("/productions", svc.handleListProductions)
+	// Merma de postre (sucursal/super_admin; repostero => 403 en escritura, lectura como
+	// producción). Gating inline en cada handler.
+	r.Post("/waste", svc.handleCreateWaste)
+	r.Get("/waste", svc.handleListWaste)
+	// Conteo de cierre de postres (reconciliación automática): mismo gating de sucursal.
+	r.Post("/counts", svc.handleCreateCount)
+	r.Get("/counts", svc.handleListCounts)
+	r.Get("/counts/{id}", svc.handleGetCount)
 	return r
+}
+
+// resolveWasteBranch resuelve la sucursal efectiva de una operación de merma/conteo según
+// el rol (mismo gating que warehouse.handleCreateWaste): rol de sucursal => su sucursal
+// activa (se ignora el branchId del body); super_admin => branchId obligatorio del body;
+// repostero => 403. Devuelve ok=false tras escribir el error HTTP.
+func (svc *Service) resolveWasteBranch(w http.ResponseWriter, r *http.Request, bodyBranchID *string) (string, bool) {
+	u, ok := user(w, r)
+	if !ok {
+		return "", false
+	}
+	if u.IsSuperAdmin {
+		if bodyBranchID == nil || *bodyBranchID == "" {
+			writeError(w, http.StatusBadRequest, "branch_required", "Selecciona una sucursal")
+			return "", false
+		}
+		return *bodyBranchID, true
+	}
+	if isBranchUser(u) {
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		if active == nil || *active == "" {
+			writeError(w, http.StatusBadRequest, "branch_required", "Selecciona una sucursal activa")
+			return "", false
+		}
+		return *active, true
+	}
+	// repostero u otro => 403.
+	writeError(w, http.StatusForbidden, "forbidden", "No autorizado")
+	return "", false
+}
+
+// resolveReadBranch resuelve el filtro de sucursal en listados de merma/conteo: rol de
+// sucursal forzado a la suya; producción (super_admin/repostero) ve todas con ?branchId
+// opcional. Devuelve ok=false tras escribir el error HTTP.
+func (svc *Service) resolveReadBranch(w http.ResponseWriter, r *http.Request) (*string, bool) {
+	u, ok := user(w, r)
+	if !ok {
+		return nil, false
+	}
+	if isProduction(u) {
+		if b := r.URL.Query().Get("branchId"); b != "" {
+			return &b, true
+		}
+		return nil, true
+	}
+	if isBranchUser(u) {
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		if active == nil || *active == "" {
+			writeError(w, http.StatusBadRequest, "branch_required", "Selecciona una sucursal activa")
+			return nil, false
+		}
+		return active, true
+	}
+	writeError(w, http.StatusForbidden, "forbidden", "No autorizado")
+	return nil, false
+}
+
+// ---- Merma de postre -------------------------------------------------------
+
+type createWasteRequest struct {
+	ProductID string  `json:"productId"`
+	Quantity  int     `json:"quantity"`
+	Reason    string  `json:"reason"`
+	BranchID  *string `json:"branchId"`
+}
+
+func (svc *Service) handleCreateWaste(w http.ResponseWriter, r *http.Request) {
+	u, ok := user(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	var req createWasteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
+		return
+	}
+	branchID, ok := svc.resolveWasteBranch(w, r, req.BranchID)
+	if !ok {
+		return
+	}
+	m, err := svc.CreateWaste(r.Context(), tenantID, branchID, req.ProductID, req.Quantity, req.Reason, u.ID)
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "El motivo y una cantidad válida son requeridos")
+	case errors.Is(err, ErrInvalidBranch):
+		writeError(w, http.StatusBadRequest, "invalid_branch", "La sucursal no es válida")
+	case errors.Is(err, ErrInvalidProduct):
+		writeError(w, http.StatusBadRequest, "invalid_product", "El producto no es un postre de repostería activo")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo registrar la merma")
+	default:
+		writeJSON(w, http.StatusCreated, map[string]any{"movement": m, "stockQty": m.StockQty})
+	}
+}
+
+func (svc *Service) handleListWaste(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	branchFilter, ok := svc.resolveReadBranch(w, r)
+	if !ok {
+		return
+	}
+	from := parseTime(r.URL.Query().Get("from"))
+	to := parseTime(r.URL.Query().Get("to"))
+	items, err := svc.ListWaste(r.Context(), tenantID, from, to, branchFilter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar las mermas")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// ---- Conteo de cierre de postres -------------------------------------------
+
+type createCountRequest struct {
+	Note     *string `json:"note"`
+	BranchID *string `json:"branchId"`
+	Items    []struct {
+		ProductID  string `json:"productId"`
+		CountedQty int    `json:"countedQty"`
+	} `json:"items"`
+}
+
+func (svc *Service) handleCreateCount(w http.ResponseWriter, r *http.Request) {
+	u, ok := user(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	var req createCountRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
+		return
+	}
+	branchID, ok := svc.resolveWasteBranch(w, r, req.BranchID)
+	if !ok {
+		return
+	}
+	items := make([]CountLineInput, 0, len(req.Items))
+	for _, it := range req.Items {
+		items = append(items, CountLineInput{ProductID: it.ProductID, CountedQty: it.CountedQty})
+	}
+	d, err := svc.CreateCount(r.Context(), tenantID, branchID, req.Note, items, u.ID)
+	switch {
+	case errors.Is(err, ErrValidation):
+		writeError(w, http.StatusBadRequest, "validation_error", "Datos del conteo inválidos")
+	case errors.Is(err, ErrInvalidBranch):
+		writeError(w, http.StatusBadRequest, "invalid_branch", "La sucursal no es válida")
+	case errors.Is(err, ErrInvalidProduct):
+		writeError(w, http.StatusBadRequest, "invalid_product", "Un producto no es un postre de repostería activo")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo registrar el conteo")
+	default:
+		writeJSON(w, http.StatusCreated, d)
+	}
+}
+
+func (svc *Service) handleGetCount(w http.ResponseWriter, r *http.Request) {
+	u, ok := user(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	d, err := svc.GetCount(r.Context(), tenantID, chi.URLParam(r, "id"))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Conteo no encontrado")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo obtener el conteo")
+		return
+	}
+	// Autorización de lectura: producción (todas) o la sucursal dueña.
+	if !isProduction(u) {
+		active, _ := auth.ActiveBranchFromContext(r.Context())
+		if !(isBranchUser(u) && active != nil && *active == d.Count.BranchID) {
+			writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ver este conteo")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+func (svc *Service) handleListCounts(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	branchFilter, ok := svc.resolveReadBranch(w, r)
+	if !ok {
+		return
+	}
+	from := parseTime(r.URL.Query().Get("from"))
+	to := parseTime(r.URL.Query().Get("to"))
+	items, err := svc.ListCounts(r.Context(), tenantID, branchFilter, from, to)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudieron listar los conteos")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 // ---- Helpers de rol --------------------------------------------------------

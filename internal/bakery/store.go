@@ -78,6 +78,23 @@ func (s *store) productBakeryActive(ctx context.Context, tenantID, productID str
 	return ok, err
 }
 
+// productBakeryName devuelve el nombre del producto si es del negocio, activo y de
+// repostería; "" si no cumple (o uuid mal formado/ajeno).
+func (s *store) productBakeryName(ctx context.Context, tenantID, productID string) (string, error) {
+	var name string
+	err := s.pool.QueryRow(ctx,
+		`SELECT name FROM products
+		  WHERE id = $1 AND tenant_id = $2 AND status = 'active' AND fulfillment_type = 'bakery'`,
+		productID, tenantID).Scan(&name)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), isInvalidUUID(err):
+		return "", nil
+	case err != nil:
+		return "", err
+	}
+	return name, nil
+}
+
 // ---- Pedidos ---------------------------------------------------------------
 
 // createOrder inserta un pedido en estado 'pending' y devuelve el pedido con nombres
@@ -449,6 +466,323 @@ func (s *store) listProductions(ctx context.Context, tenantID string, from, to *
 			return nil, err
 		}
 		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// ---- Merma de postre (§merma de repostería) --------------------------------
+
+// insertWaste registra una merma de postre en UNA transacción (calca
+// warehouse.insertWasteBranch pero sobre product_branch_stock/product_stock_movements):
+// revalida que el producto siga siendo bakery + activo bajo la misma tx, inserta el
+// movimiento firmado (type='waste', quantity=-qty) y actualiza el cache de la sucursal
+// (upsert lazy). Devuelve el movimiento y el nuevo stock de la sucursal. qty > 0 (el
+// service lo valida); se guarda como negativo.
+func (s *store) insertWaste(ctx context.Context, tenantID, productID, branchID string, qty int, reason, createdBy string) (WasteMovement, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return WasteMovement{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var ft, pstatus, pname string
+	err = tx.QueryRow(ctx,
+		`SELECT fulfillment_type, status, name FROM products WHERE id = $1 AND tenant_id = $2`,
+		productID, tenantID).Scan(&ft, &pstatus, &pname)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), isInvalidUUID(err):
+		return WasteMovement{}, ErrInvalidProduct
+	case err != nil:
+		return WasteMovement{}, err
+	}
+	if ft != "bakery" || pstatus != "active" {
+		return WasteMovement{}, ErrInvalidProduct
+	}
+
+	var m WasteMovement
+	err = tx.QueryRow(ctx,
+		`INSERT INTO product_stock_movements
+		     (tenant_id, product_id, branch_id, type, quantity, reason, created_by)
+		 VALUES ($1, $2, $3, 'waste', $4, $5, $6)
+		 RETURNING id::text, created_at`,
+		tenantID, productID, branchID, -qty, reason, createdBy).Scan(&m.ID, &m.CreatedAt)
+	if err != nil {
+		return WasteMovement{}, err
+	}
+
+	var stockQty int
+	err = tx.QueryRow(ctx,
+		`INSERT INTO product_branch_stock (tenant_id, product_id, branch_id, stock_qty)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (product_id, branch_id) DO UPDATE
+		    SET stock_qty = product_branch_stock.stock_qty + EXCLUDED.stock_qty,
+		        updated_at = now()
+		 RETURNING stock_qty`,
+		tenantID, productID, branchID, -qty).Scan(&stockQty)
+	if err != nil {
+		return WasteMovement{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return WasteMovement{}, err
+	}
+
+	r := reason
+	m.ProductID = productID
+	m.ProductName = pname
+	m.BranchID = branchID
+	m.Quantity = -qty
+	m.Reason = &r
+	m.StockQty = stockQty
+	return m, nil
+}
+
+// listWaste lista las mermas de postre del negocio (DESC, LIMIT 100) con filtros
+// opcionales de rango y sucursal.
+func (s *store) listWaste(ctx context.Context, tenantID string, from, to *time.Time, branchID *string) ([]WasteAudit, error) {
+	args := []any{tenantID}
+	sql := `SELECT m.id::text, m.product_id::text, p.name, m.branch_id::text, b.name,
+		           m.quantity, m.reason, u.name, m.created_at
+		      FROM product_stock_movements m
+		      JOIN products p ON p.id = m.product_id
+		      JOIN branches b ON b.id = m.branch_id
+		      LEFT JOIN users u ON u.id = m.created_by
+		     WHERE m.tenant_id = $1 AND m.type = 'waste'`
+	if from != nil {
+		args = append(args, *from)
+		sql += ` AND m.created_at >= $` + strconv.Itoa(len(args))
+	}
+	if to != nil {
+		args = append(args, *to)
+		sql += ` AND m.created_at < $` + strconv.Itoa(len(args))
+	}
+	if branchID != nil {
+		args = append(args, *branchID)
+		sql += ` AND m.branch_id = $` + strconv.Itoa(len(args))
+	}
+	sql += ` ORDER BY m.created_at DESC LIMIT 100`
+
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		if isInvalidUUID(err) {
+			return []WasteAudit{}, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []WasteAudit{}
+	for rows.Next() {
+		var it WasteAudit
+		if err := rows.Scan(&it.ID, &it.ProductID, &it.ProductName, &it.BranchID, &it.BranchName,
+			&it.Quantity, &it.Reason, &it.CreatedByName, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// ---- Conteo de cierre de postres (reconciliación) --------------------------
+
+// Motivos fijos de la reconciliación automática del conteo de cierre.
+const (
+	countWasteReason  = "Merma automática por conteo de cierre"
+	countAdjustReason = "Ajuste por conteo de cierre (sobrante)"
+)
+
+// createCount ejecuta el conteo de cierre en UNA transacción: por cada línea (en orden
+// ascendente de product_id, ya ordenado por el service para evitar deadlocks, mismo
+// criterio que produce()) bloquea el cache de la sucursal con SELECT ... FOR UPDATE,
+// calcula expected = stock actual, diff = contado - expected; si diff<0 registra una
+// merma (type='waste'), si diff>0 un ajuste (type='adjustment'), si diff=0 no mueve nada;
+// y deja el cache en el valor contado. Inserta el header y las líneas. Devuelve el detalle
+// con el tipo de movimiento por línea. lines debe venir ordenado por ProductID ASC y con
+// productos ya validados (bakery + activos, sin duplicados).
+func (s *store) createCount(ctx context.Context, tenantID, branchID string, note *string, lines []countLine, createdBy string) (CountDetail, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return CountDetail{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var d CountDetail
+	err = tx.QueryRow(ctx,
+		`INSERT INTO bakery_counts (tenant_id, branch_id, note, created_by)
+		 VALUES ($1, $2, $3, $4)
+		 RETURNING id::text, created_at`,
+		tenantID, branchID, note, createdBy).Scan(&d.Count.ID, &d.Count.CreatedAt)
+	if err != nil {
+		return CountDetail{}, err
+	}
+
+	d.Items = []CountItem{}
+	for _, ln := range lines {
+		// Bloqueo del cache de la sucursal para este producto (lazy: puede no existir).
+		// LIMITACIÓN CONOCIDA (aceptada MVP): si la fila aún NO existe (producto sin
+		// movimientos previos en esta sucursal), FOR UPDATE no bloquea nada y dos conteos
+		// concurrentes del mismo (producto, sucursal) podrían intercalar su INSERT
+		// ON CONFLICT. Cuando la fila existe (caso normal: hubo producción antes) el lock sí
+		// serializa. El escenario (dos cierres físicos simultáneos del mismo postre SIN
+		// historial en esa sucursal) es muy poco probable en la operación de Vanta.
+		// TODO(v2): materializar la fila lazy (INSERT ... ON CONFLICT DO NOTHING) antes del
+		// FOR UPDATE para cerrar la ventana.
+		var expected int
+		err = tx.QueryRow(ctx,
+			`SELECT stock_qty FROM product_branch_stock
+			  WHERE product_id = $1 AND branch_id = $2 AND tenant_id = $3 FOR UPDATE`,
+			ln.ProductID, branchID, tenantID).Scan(&expected)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return CountDetail{}, err
+		}
+		// pgx.ErrNoRows => sin fila: expected queda en 0.
+
+		diff := ln.CountedQty - expected
+		var movementID *string
+		var movementType *string
+		if diff != 0 {
+			typ := "adjustment"
+			reason := countAdjustReason
+			if diff < 0 {
+				typ = "waste"
+				reason = countWasteReason
+			}
+			var mid string
+			err = tx.QueryRow(ctx,
+				`INSERT INTO product_stock_movements
+				     (tenant_id, product_id, branch_id, type, quantity, reason, bakery_count_id, created_by)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				 RETURNING id::text`,
+				tenantID, ln.ProductID, branchID, typ, diff, reason, d.Count.ID, createdBy).Scan(&mid)
+			if err != nil {
+				return CountDetail{}, err
+			}
+			// Deja el cache en el valor contado (expected + diff == countedQty).
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO product_branch_stock (tenant_id, product_id, branch_id, stock_qty)
+				 VALUES ($1, $2, $3, $4)
+				 ON CONFLICT (product_id, branch_id) DO UPDATE
+				    SET stock_qty = product_branch_stock.stock_qty + EXCLUDED.stock_qty,
+				        updated_at = now()`,
+				tenantID, ln.ProductID, branchID, diff); err != nil {
+				return CountDetail{}, err
+			}
+			movementID = &mid
+			t := typ
+			movementType = &t
+		}
+
+		var itemID string
+		err = tx.QueryRow(ctx,
+			`INSERT INTO bakery_count_items
+			     (tenant_id, count_id, product_id, expected_qty, counted_qty, diff_qty, movement_id)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 RETURNING id::text`,
+			tenantID, d.Count.ID, ln.ProductID, expected, ln.CountedQty, diff, movementID).Scan(&itemID)
+		if err != nil {
+			return CountDetail{}, err
+		}
+		d.Items = append(d.Items, CountItem{
+			ID: itemID, ProductID: ln.ProductID, ProductName: ln.ProductName,
+			ExpectedQty: expected, CountedQty: ln.CountedQty, DiffQty: diff,
+			MovementID: movementID, MovementType: movementType,
+		})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return CountDetail{}, err
+	}
+
+	// Completar el header con nombres resueltos para la respuesta.
+	head, err := s.getCount(ctx, tenantID, d.Count.ID)
+	if err != nil {
+		return CountDetail{}, err
+	}
+	d.Count = head.Count
+	return d, nil
+}
+
+// getCount devuelve un conteo (header + líneas con nombres resueltos y movementType).
+// uuid mal formado/ajeno => ErrNotFound.
+func (s *store) getCount(ctx context.Context, tenantID, id string) (CountDetail, error) {
+	var d CountDetail
+	err := s.pool.QueryRow(ctx,
+		`SELECT c.id::text, c.branch_id::text, b.name, c.note, u.name, c.created_at
+		   FROM bakery_counts c
+		   JOIN branches b ON b.id = c.branch_id
+		   LEFT JOIN users u ON u.id = c.created_by
+		  WHERE c.id = $1 AND c.tenant_id = $2`, id, tenantID).
+		Scan(&d.Count.ID, &d.Count.BranchID, &d.Count.BranchName, &d.Count.Note, &d.Count.CreatedByName, &d.Count.CreatedAt)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows), isInvalidUUID(err):
+		return CountDetail{}, ErrNotFound
+	case err != nil:
+		return CountDetail{}, err
+	}
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT ci.id::text, ci.product_id::text, p.name, ci.expected_qty, ci.counted_qty,
+		        ci.diff_qty, ci.movement_id::text, m.type
+		   FROM bakery_count_items ci
+		   JOIN products p ON p.id = ci.product_id
+		   LEFT JOIN product_stock_movements m ON m.id = ci.movement_id
+		  WHERE ci.count_id = $1 AND ci.tenant_id = $2
+		  ORDER BY p.name`, id, tenantID)
+	if err != nil {
+		return CountDetail{}, err
+	}
+	defer rows.Close()
+
+	d.Items = []CountItem{}
+	for rows.Next() {
+		var it CountItem
+		if err := rows.Scan(&it.ID, &it.ProductID, &it.ProductName, &it.ExpectedQty, &it.CountedQty,
+			&it.DiffQty, &it.MovementID, &it.MovementType); err != nil {
+			return CountDetail{}, err
+		}
+		d.Items = append(d.Items, it)
+	}
+	return d, rows.Err()
+}
+
+// listCounts lista los encabezados de conteo del negocio (DESC, LIMIT 100) con filtros
+// opcionales de sucursal y rango.
+func (s *store) listCounts(ctx context.Context, tenantID string, branchID *string, from, to *time.Time) ([]Count, error) {
+	args := []any{tenantID}
+	sql := `SELECT c.id::text, c.branch_id::text, b.name, c.note, u.name, c.created_at
+		      FROM bakery_counts c
+		      JOIN branches b ON b.id = c.branch_id
+		      LEFT JOIN users u ON u.id = c.created_by
+		     WHERE c.tenant_id = $1`
+	if branchID != nil {
+		args = append(args, *branchID)
+		sql += ` AND c.branch_id = $` + strconv.Itoa(len(args))
+	}
+	if from != nil {
+		args = append(args, *from)
+		sql += ` AND c.created_at >= $` + strconv.Itoa(len(args))
+	}
+	if to != nil {
+		args = append(args, *to)
+		sql += ` AND c.created_at < $` + strconv.Itoa(len(args))
+	}
+	sql += ` ORDER BY c.created_at DESC LIMIT 100`
+
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		if isInvalidUUID(err) {
+			return []Count{}, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Count{}
+	for rows.Next() {
+		var c Count
+		if err := rows.Scan(&c.ID, &c.BranchID, &c.BranchName, &c.Note, &c.CreatedByName, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }

@@ -15,11 +15,13 @@ import (
 	"faro/internal/branches"
 	"faro/internal/categories"
 	"faro/internal/customers"
+	"faro/internal/dayclose"
 	"faro/internal/expenses"
 	"faro/internal/insights"
 	"faro/internal/loyalty"
 	"faro/internal/products"
 	"faro/internal/reports"
+	"faro/internal/requisitions"
 	"faro/internal/sales"
 	"faro/internal/settings"
 	"faro/internal/supplies"
@@ -30,7 +32,7 @@ import (
 // New construye el handler HTTP raíz. Los módulos (auth, products, …) montarán
 // aquí sus sub-routers en incrementos siguientes. corsOrigin es el origen del
 // frontend (faro-ui) autorizado a consumir la API con credenciales.
-func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, insightsSvc *insights.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, bakerySvc *bakery.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
+func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, insightsSvc *insights.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, bakerySvc *bakery.Service, requisitionsSvc *requisitions.Service, daycloseSvc *dayclose.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
@@ -101,6 +103,12 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 	// Repostería / producción central (M10): pedidos de sucursal, producción (doble
 	// efecto de stock), stock de postre y auditoría. Autorización inline por rol.
 	r.Mount("/bakery", bakerySvc.Routes(authSvc.RequireSession))
+	// Requisiciones de insumos (M11): sucursal solicita, super admin surte (vía almacén).
+	// Autorización inline por rol; ver requisitions.Routes.
+	r.Mount("/requisitions", requisitionsSvc.Routes(authSvc.RequireSession))
+	// Cierre de día / corte de caja por sucursal (M11): operable por cualquier rol de
+	// sucursal para su sucursal activa; super admin ve todos. Autorización inline propia.
+	r.Mount("/dayclose", daycloseSvc.Routes(authSvc.RequireSession))
 	// Subida de imágenes (POST, solo super admin) y servir archivos estáticos (público).
 	r.Mount("/uploads", uploadsH.Routes())
 	r.Handle("/files/*", http.StripPrefix("/files/", http.FileServer(http.Dir(uploadDir))))

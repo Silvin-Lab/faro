@@ -14,12 +14,13 @@ import (
 )
 
 var (
-	ErrNotFound        = errors.New("not found")
-	ErrNameTaken       = errors.New("name taken")
-	ErrInvalidSupply   = errors.New("invalid supply")
-	ErrInvalidSupplier = errors.New("invalid supplier")
-	ErrInvalidBranch   = errors.New("invalid branch")
-	ErrValidation      = errors.New("validation")
+	ErrNotFound               = errors.New("not found")
+	ErrNameTaken              = errors.New("name taken")
+	ErrInvalidSupply          = errors.New("invalid supply")
+	ErrInvalidSupplier        = errors.New("invalid supplier")
+	ErrInvalidBranch          = errors.New("invalid branch")
+	ErrValidation             = errors.New("validation")
+	ErrInvalidRequisitionItem = errors.New("invalid requisition item")
 )
 
 type store struct {
@@ -449,26 +450,114 @@ func (s *store) insertAdjustment(ctx context.Context, tenantID, supplyID string,
 // que supply_branch_stock (anti-deadlock entre dispatches concurrentes del mismo
 // supply/sucursal). El transfer de sucursal HEREDA el created_at del dispatch.
 // Reutiliza el upsert de sucursal de supplies (UpsertBranchStock).
-func (s *store) insertDispatch(ctx context.Context, tenantID, supplyID, branchID string, qty int, createdBy string, createdAt *time.Time) (WarehouseMovement, int, int, error) {
+func (s *store) insertDispatch(ctx context.Context, tenantID, supplyID, branchID string, qty int, reqItemID *string, createdBy string, createdAt *time.Time) (WarehouseMovement, int, int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return WarehouseMovement{}, 0, 0, err
 	}
 	defer tx.Rollback(ctx)
 
-	// 1. warehouse_movements (dispatch, −qty, branch destino).
+	// 0. Si la salida surte una requisición (M11): resuelve y valida el enlace ANTES del
+	//    INSERT (para que requisition_id viaje en él). Orden de bloqueo determinista:
+	//    requisición (padre) -> línea -> [warehouse_stock -> supply_branch_stock más
+	//    abajo]. Bloquear la fila PADRE con FOR UPDATE serializa dos dispatches concurrentes
+	//    que surten las últimas líneas de la MISMA requisición: sin ese lock, bajo READ
+	//    COMMITTED ambos podrían recalcular el status con un snapshot viejo y dejarla
+	//    atascada en 'partial'. cancel/close solo LEEN ítems (sin lock) y toman el lock del
+	//    padre igual, así que no hay deadlock cruzado.
+	var requisitionID *string
+	if reqItemID != nil {
+		// 0a. Lock del padre a partir de la línea (una sola query, orden padre-antes-de-línea
+		//     garantizado porque bloqueamos supply_requisitions vía su id resuelto). Se hace
+		//     en dos pasos para respetar el orden de locks: primero el id del padre.
+		var reqID, itemSupplyID string
+		err = tx.QueryRow(ctx,
+			`SELECT requisition_id::text, supply_id::text
+			   FROM supply_requisition_items
+			  WHERE id = $1 AND tenant_id = $2`,
+			*reqItemID, tenantID).Scan(&reqID, &itemSupplyID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
+			return WarehouseMovement{}, 0, 0, ErrInvalidRequisitionItem
+		case err != nil:
+			return WarehouseMovement{}, 0, 0, err
+		}
+		if itemSupplyID != supplyID {
+			return WarehouseMovement{}, 0, 0, ErrInvalidRequisitionItem
+		}
+		// 0b. Lock del PADRE (serializa el recálculo de status) y captura branch/status bajo
+		//     lock. La línea se re-bloquea después, ya con el padre tomado.
+		var reqBranchID, reqStatus string
+		err = tx.QueryRow(ctx,
+			`SELECT branch_id::text, status FROM supply_requisitions
+			  WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+			reqID, tenantID).Scan(&reqBranchID, &reqStatus)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows), pgCode(err, "22P02"):
+			return WarehouseMovement{}, 0, 0, ErrInvalidRequisitionItem
+		case err != nil:
+			return WarehouseMovement{}, 0, 0, err
+		}
+		// La sucursal destino del dispatch DEBE ser la dueña de la requisición: si no, se
+		// estaría inflando quantity_fulfilled de la sucursal A surtiendo a la B.
+		if reqBranchID != branchID {
+			return WarehouseMovement{}, 0, 0, ErrInvalidRequisitionItem
+		}
+		// Solo se acredita surtido sobre requisiciones abiertas (pending/partial): una
+		// cancelada o ya fulfilled no debe acumular más.
+		if reqStatus != "pending" && reqStatus != "partial" {
+			return WarehouseMovement{}, 0, 0, ErrInvalidRequisitionItem
+		}
+		// 0c. Re-bloquea la línea (ya con el padre tomado).
+		if _, err := tx.Exec(ctx,
+			`SELECT 1 FROM supply_requisition_items WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+			*reqItemID, tenantID); err != nil {
+			return WarehouseMovement{}, 0, 0, err
+		}
+		requisitionID = &reqID
+	}
+
+	// 1. warehouse_movements (dispatch, −qty, branch destino, requisition_id opcional).
 	var m WarehouseMovement
 	err = tx.QueryRow(ctx,
 		`INSERT INTO warehouse_movements
-		     (tenant_id, supply_id, type, quantity_base, branch_id, created_by, created_at)
-		 VALUES ($1, $2, 'dispatch', $3, $4, $5, COALESCE($6, now()))
+		     (tenant_id, supply_id, type, quantity_base, branch_id, requisition_id, created_by, created_at)
+		 VALUES ($1, $2, 'dispatch', $3, $4, $5, $6, COALESCE($7, now()))
 		 RETURNING id::text, tenant_id::text, supply_id::text, type, quantity_base,
 		           branch_id::text, supplier_id::text, packages, unit_cost_cents, reason, created_by::text, created_at`,
-		tenantID, supplyID, -qty, branchID, createdBy, createdAt).
+		tenantID, supplyID, -qty, branchID, requisitionID, createdBy, createdAt).
 		Scan(&m.ID, &m.TenantID, &m.SupplyID, &m.Type, &m.QuantityBase, &m.BranchID, &m.SupplierID,
 			&m.Packages, &m.UnitCostCents, &m.Reason, &m.CreatedBy, &m.CreatedAt)
 	if err != nil {
 		return WarehouseMovement{}, 0, 0, err
+	}
+
+	// 1b. Surtido de la requisición: acumula lo despachado en la línea y recalcula el
+	//     estado de la requisición (fulfilled si TODAS las líneas están completas, si no
+	//     partial). Todo dentro de la misma transacción del dispatch, con el padre ya
+	//     bloqueado (paso 0b) y su status validado como pending/partial.
+	if reqItemID != nil {
+		if _, err := tx.Exec(ctx,
+			`UPDATE supply_requisition_items
+			    SET quantity_fulfilled = quantity_fulfilled + $2
+			  WHERE id = $1`,
+			*reqItemID, qty); err != nil {
+			return WarehouseMovement{}, 0, 0, err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE supply_requisitions r
+			    SET status = CASE
+			        WHEN NOT EXISTS (
+			            SELECT 1 FROM supply_requisition_items i
+			             WHERE i.requisition_id = r.id
+			               AND i.quantity_fulfilled < i.quantity_requested
+			        ) THEN 'fulfilled'
+			        ELSE 'partial' END,
+			        updated_at = now()
+			  WHERE r.id = $1 AND r.status IN ('pending','partial')`,
+			*requisitionID); err != nil {
+			return WarehouseMovement{}, 0, 0, err
+		}
 	}
 
 	// 2. warehouse_stock −= qty (se bloquea SIEMPRE antes que supply_branch_stock).
@@ -610,7 +699,9 @@ func (s *store) insertWasteBranch(ctx context.Context, tenantID, supplyID, branc
 
 // listWaste devuelve el historial de mermas = UNION de warehouse_movements(waste,
 // branch NULL) y supply_movements(waste, branch set), ordenado por created_at DESC.
-func (s *store) listWaste(ctx context.Context, tenantID string, from, to *time.Time) ([]WasteItem, error) {
+// branchScope != nil acota a una sucursal: solo mermas de esa sucursal (rama de
+// supply_movements); excluye las del almacén central (rama de warehouse_movements).
+func (s *store) listWaste(ctx context.Context, tenantID string, from, to *time.Time, branchScope *string) ([]WasteItem, error) {
 	args := []any{tenantID}
 	filter := ""
 	if from != nil {
@@ -621,9 +712,10 @@ func (s *store) listWaste(ctx context.Context, tenantID string, from, to *time.T
 		args = append(args, *to)
 		filter += ` AND created_at < $` + strconv.Itoa(len(args))
 	}
-	q := `SELECT id, supply_id, supply_name, branch_id, branch_name, reason, quantity_base, origin, created_by_name, created_at
-	        FROM (
-	          SELECT m.id::text AS id, m.supply_id::text AS supply_id, sp.name AS supply_name,
+	// Scope de sucursal: si viene, se filtra la rama de sucursal y se ANULA la del almacén
+	// central (que por definición no tiene sucursal). $branchArg reutiliza el mismo índice
+	// en ambas ramas.
+	whHead := `SELECT m.id::text AS id, m.supply_id::text AS supply_id, sp.name AS supply_name,
 	                 m.branch_id::text AS branch_id, b.name AS branch_name, m.reason AS reason,
 	                 m.quantity_base AS quantity_base, 'warehouse' AS origin, u.name AS created_by_name,
 	                 m.created_at AS created_at
@@ -631,7 +723,17 @@ func (s *store) listWaste(ctx context.Context, tenantID string, from, to *time.T
 	            JOIN supplies sp ON sp.id = m.supply_id
 	            LEFT JOIN branches b ON b.id = m.branch_id
 	            LEFT JOIN users u ON u.id = m.created_by
-	           WHERE m.tenant_id = $1 AND m.type = 'waste'` + filter + `
+	           WHERE m.tenant_id = $1 AND m.type = 'waste'` + filter
+	branchFilter := filter
+	if branchScope != nil {
+		// Excluye por completo la merma del almacén central.
+		whHead += ` AND FALSE`
+		args = append(args, *branchScope)
+		branchFilter += ` AND sm.branch_id = $` + strconv.Itoa(len(args))
+	}
+	q := `SELECT id, supply_id, supply_name, branch_id, branch_name, reason, quantity_base, origin, created_by_name, created_at
+	        FROM (
+	          ` + whHead + `
 	          UNION ALL
 	          SELECT sm.id::text, sm.supply_id::text, sp.name, sm.branch_id::text, b.name, sm.reason,
 	                 sm.quantity_base, 'branch', u.name, sm.created_at
@@ -639,7 +741,7 @@ func (s *store) listWaste(ctx context.Context, tenantID string, from, to *time.T
 	            JOIN supplies sp ON sp.id = sm.supply_id
 	            LEFT JOIN branches b ON b.id = sm.branch_id
 	            LEFT JOIN users u ON u.id = sm.created_by
-	           WHERE sm.tenant_id = $1 AND sm.type = 'waste'` + filter + `
+	           WHERE sm.tenant_id = $1 AND sm.type = 'waste'` + branchFilter + `
 	        ) x
 	       ORDER BY created_at DESC LIMIT 100`
 
