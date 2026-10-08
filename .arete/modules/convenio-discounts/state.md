@@ -13,8 +13,8 @@ Ajuste del orquestador al spec (gate): caso "sin cliente + agreementDiscountId" 
 - [x] Frontend (frontend-engineer) — POS (botones dinámicos, desglose, 422 visible), /agreement-discounts (Convenios, grupo Clientes), SaleTicket (Convenio + Cobró), reportes (tarjeta + columnas). Pendiente confirmar con Silvin: 'Reactivar' recrea el % (no flip de status).
 - [x] QA de regresión del POS — cubierta por los tests de integración del backend (8 casos de venta); QA manual en la demo
 - [x] Code review (code-reviewer) — APROBADO sin bloqueantes. Menores: reactivar=recrear (acumula filas inactive), preview con catálogo cacheado, convenio con monto 0 cuando lealtad cubre todo
-- [ ] Demo local → confirmación de Silvin
-- [ ] Deploy (migración 0031+ a Neon, Fly, Vercel)
+- [x] Demo local → confirmación de Silvin (2026-10-07)
+- [x] Deploy 2026-10-07: respaldo prod `faro-backups/faro-prod-20261007-2144-pre0031.dump`, 0031+0032 a Neon (957 ventas intactas), Fly + Vercel, smoke OK
 
 ## Ajuste agregado 2026-10-07 (mismo deploy): visitas previas solo admins + auditoría
 Pedido de Silvin: cajero/barista no ven ni pueden mandar priorVisits al crear cliente (403 prior_visits_forbidden); super_admin/branch_admin sí. Migración 0032 (customers.created_by + customer_visit_changes, escrita en la misma tx en alta y PATCH visits), GET /customers/{id}/visit-changes (admins). Review APROBADO. Migración 0032 aplicada a faro_test y BD dev.
