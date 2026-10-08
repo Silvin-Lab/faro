@@ -24,7 +24,7 @@ func testSvc(t *testing.T) (*Service, *pgxpool.Pool, string, string) {
 		pool.Close()
 		t.Skipf("DB de test no disponible: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE expenses, expense_concepts, expense_categories, sale_items, sales, products, categories, customers, users, branches, tenants RESTART IDENTITY CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE agreement_discounts, expenses, expense_concepts, expense_categories, sale_items, sales, products, categories, customers, users, branches, tenants RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -89,6 +89,92 @@ func TestSalesReport(t *testing.T) {
 	}
 	if repB.TotalCents != 9999 || repB.SalesCount != 1 || len(repB.ByCategory) != 0 {
 		t.Fatalf("aislamiento B: total=%d count=%d categorías=%d", repB.TotalCents, repB.SalesCount, len(repB.ByCategory))
+	}
+}
+
+// TestSalesReportAgreementDiscounts cubre el bloque nuevo de convenio (M12): el
+// totalCents del reporte sigue siendo NETO (no cambia por el convenio) y el bloque
+// agreementDiscounts cuadra (suma de byPercent == totalCents; salesCount cuenta solo
+// ventas con convenio). También verifica los campos nuevos de /reports/sales/list.
+func TestSalesReportAgreementDiscounts(t *testing.T) {
+	svc, pool, a, _ := testSvc(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	var userID string
+	pool.QueryRow(ctx, "INSERT INTO users (tenant_id,email,password_hash,name,role) VALUES ($1,'caja@t.test','x','Caja Uno','cashier') RETURNING id::text", a).Scan(&userID)
+
+	// Tres ventas con convenio para tenant A (total_cents YA neto). Dos al 10% y una
+	// al 15%. (testSvc ya creó 2 ventas SIN convenio por 15000.)
+	ins := func(total, pct, agCents int, user *string) {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO sales (tenant_id,total_cents,amount_paid_cents,change_cents,payment_method,agreement_discount_percent,agreement_discount_cents,user_id)
+			 VALUES ($1,$2,$2,0,'cash',$3,$4,$5)`,
+			a, total, pct, agCents, user); err != nil {
+			t.Fatalf("seed venta convenio: %v", err)
+		}
+	}
+	ins(9000, 10, 1000, &userID)
+	ins(9000, 10, 1000, &userID)
+	ins(8500, 15, 1500, &userID)
+
+	from := time.Now().Add(-time.Hour)
+	to := time.Now().Add(time.Hour)
+
+	rep, err := svc.SalesReport(ctx, a, from, to, 0, BranchFilter{})
+	if err != nil {
+		t.Fatalf("reporte: %v", err)
+	}
+
+	// totalCents NETO: 15000 (2 ventas sin convenio) + 9000 + 9000 + 8500 = 41500.
+	// salesCount total = 5 (NO solo las de convenio).
+	if rep.TotalCents != 41500 || rep.SalesCount != 5 {
+		t.Fatalf("resumen neto: total=%d count=%d (esperaba 41500/5)", rep.TotalCents, rep.SalesCount)
+	}
+
+	// Bloque de convenio: 3 ventas con convenio, monto total 1000+1000+1500 = 3500.
+	ad := rep.AgreementDiscounts
+	if ad.SalesCount != 3 || ad.TotalCents != 3500 {
+		t.Fatalf("convenio resumen: count=%d total=%d (esperaba 3/3500)", ad.SalesCount, ad.TotalCents)
+	}
+	// byPercent: 10% -> 2 ventas / 2000; 15% -> 1 venta / 1500; ordenado ASC.
+	if len(ad.ByPercent) != 2 ||
+		ad.ByPercent[0].Percent != 10 || ad.ByPercent[0].Count != 2 || ad.ByPercent[0].TotalCents != 2000 ||
+		ad.ByPercent[1].Percent != 15 || ad.ByPercent[1].Count != 1 || ad.ByPercent[1].TotalCents != 1500 {
+		t.Fatalf("convenio byPercent inesperado: %+v", ad.ByPercent)
+	}
+	// Suma de byPercent cuadra con el total del bloque.
+	sum := 0
+	for _, p := range ad.ByPercent {
+		sum += p.TotalCents
+	}
+	if sum != ad.TotalCents {
+		t.Fatalf("byPercent no cuadra: suma=%d total=%d", sum, ad.TotalCents)
+	}
+
+	// /reports/sales/list: campos nuevos presentes. Ventas con convenio traen % y
+	// soldByName; las sin convenio traen 0/null.
+	list, err := svc.SalesList(ctx, a, from, to, BranchFilter{})
+	if err != nil {
+		t.Fatalf("salesList: %v", err)
+	}
+	if len(list) != 5 {
+		t.Fatalf("salesList: %d filas (esperaba 5)", len(list))
+	}
+	nWithAgreement, nWithUser := 0, 0
+	for _, it := range list {
+		if it.AgreementDiscountCents > 0 {
+			nWithAgreement++
+			if it.AgreementDiscountPercent == nil {
+				t.Fatalf("venta con convenio sin percent: %+v", it)
+			}
+		}
+		if it.SoldByName != nil && *it.SoldByName == "Caja Uno" {
+			nWithUser++
+		}
+	}
+	if nWithAgreement != 3 || nWithUser != 3 {
+		t.Fatalf("salesList campos: convenio=%d usuario=%d (esperaba 3/3)", nWithAgreement, nWithUser)
 	}
 }
 

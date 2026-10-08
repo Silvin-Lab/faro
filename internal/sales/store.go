@@ -17,6 +17,9 @@ var (
 	ErrInsufficientPayment  = errors.New("insufficient payment")
 	ErrInvalidCustomer      = errors.New("invalid customer")
 	ErrPromotionNotEligible = errors.New("promotion not eligible")
+	// ErrAgreementNotEligible: el descuento de convenio no existe, no está activo,
+	// es de otro tenant, o llegó sin cliente asociado (ADR-010 §D3, gate M12).
+	ErrAgreementNotEligible = errors.New("agreement discount not eligible")
 )
 
 type store struct {
@@ -48,7 +51,7 @@ type promotion struct {
 // lealtad se calculan con los precios de los productos del negocio (no se confía
 // en el cliente). Si se aplica una promoción, escribe el snapshot en
 // loyalty_redemptions e incrementa/reinicia el contador de visitas.
-func (s *store) createSale(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID, branchID *string) (Sale, error) {
+func (s *store) createSale(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID, branchID, agreementDiscountID, userID *string) (Sale, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Sale{}, err
@@ -152,7 +155,37 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 		// descuento resulta 0: se cobra normal, sin historial ni reinicio.
 	}
 
-	total = subtotal - discountCents
+	// Convenio (opcional): % sobre el SUBTOTAL RESTANTE tras la lealtad (ADR-010
+	// §D2). Requiere cliente (el service ya rechaza con 422 un convenio sin cliente)
+	// y un descuento activo del tenant. No se confía en el % del cliente: se lee del
+	// catálogo y se guarda como snapshot. Misma regla de redondeo half-up que lealtad.
+	agreementCents := 0
+	var agreementPercent *int
+	if agreementDiscountID != nil && customerID != nil {
+		var pct int
+		err := tx.QueryRow(ctx,
+			`SELECT percent FROM agreement_discounts
+			  WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
+			*agreementDiscountID, tenantID).Scan(&pct)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows), dberr.IsInvalidText(err):
+			return Sale{}, ErrAgreementNotEligible
+		case err != nil:
+			return Sale{}, err
+		}
+		remaining := subtotal - discountCents
+		d := (remaining*pct + 50) / 100 // round half-up en centavos
+		if d < 0 {
+			d = 0
+		}
+		if d > remaining {
+			d = remaining
+		}
+		agreementCents = d
+		agreementPercent = &pct
+	}
+
+	total = subtotal - discountCents - agreementCents
 
 	// Pago exacto (tarjeta, transferencia, didi): el monto pagado es exactamente
 	// el total (sin cambio). Efectivo: se valida que alcance y se calcula el cambio.
@@ -170,14 +203,28 @@ func (s *store) createSale(ctx context.Context, tenantID string, items []LineInp
 
 	var sale Sale
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO sales (tenant_id, total_cents, amount_paid_cents, change_cents, payment_method, customer_id, discount_cents, branch_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		 RETURNING id::text, tenant_id::text, total_cents, amount_paid_cents, change_cents, payment_method, customer_id::text, discount_cents, branch_id::text, created_at`,
-		tenantID, total, amountPaid, change, paymentMethod, customerID, discountCents, branchID).
-		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.DiscountCents, &sale.BranchID, &sale.CreatedAt); err != nil {
+		`INSERT INTO sales (tenant_id, total_cents, amount_paid_cents, change_cents, payment_method, customer_id, discount_cents, branch_id,
+		                    agreement_discount_id, agreement_discount_percent, agreement_discount_cents, user_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		 RETURNING id::text, tenant_id::text, total_cents, amount_paid_cents, change_cents, payment_method, customer_id::text, discount_cents, branch_id::text,
+		           agreement_discount_id::text, agreement_discount_percent, agreement_discount_cents, user_id::text, created_at`,
+		tenantID, total, amountPaid, change, paymentMethod, customerID, discountCents, branchID,
+		agreementDiscountID, agreementPercent, agreementCents, userID).
+		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.DiscountCents, &sale.BranchID,
+			&sale.AgreementDiscountID, &sale.AgreementDiscountPercent, &sale.AgreementDiscountCents, &sale.SoldByUserID, &sale.CreatedAt); err != nil {
 		return Sale{}, err
 	}
 	sale.CustomerName = customerName
+
+	// Nombre del usuario que cobró (informativo) para la respuesta.
+	if sale.SoldByUserID != nil {
+		var name string
+		if err := tx.QueryRow(ctx,
+			`SELECT name FROM users WHERE id = $1`, *sale.SoldByUserID).Scan(&name); err != nil {
+			return Sale{}, err
+		}
+		sale.SoldByName = &name
+	}
 
 	// Nombre de la sucursal (informativo) para la respuesta de la venta.
 	if sale.BranchID != nil {
@@ -356,11 +403,14 @@ func chooseUnit(lines []computedLine, p promotion, promotionProductID *string) *
 func (s *store) listByTenant(ctx context.Context, tenantID, branchID string, from, to *time.Time) ([]Sale, error) {
 	const base = `SELECT s.id::text, s.tenant_id::text, s.total_cents, s.amount_paid_cents, s.change_cents,
 		        s.payment_method, s.customer_id::text, (cu.first_name || ' ' || cu.last_name), s.discount_cents, lr.promotion_name,
-		        s.branch_id::text, b.name, s.created_at
+		        s.branch_id::text, b.name,
+		        s.agreement_discount_id::text, s.agreement_discount_percent, s.agreement_discount_cents, s.user_id::text, us.name,
+		        s.created_at
 		   FROM sales s
 		   LEFT JOIN customers cu ON cu.id = s.customer_id
 		   LEFT JOIN loyalty_redemptions lr ON lr.sale_id = s.id
-		   LEFT JOIN branches b ON b.id = s.branch_id `
+		   LEFT JOIN branches b ON b.id = s.branch_id
+		   LEFT JOIN users us ON us.id = s.user_id `
 
 	var rows pgx.Rows
 	var err error
@@ -380,7 +430,7 @@ func (s *store) listByTenant(ctx context.Context, tenantID, branchID string, fro
 	var out []Sale
 	for rows.Next() {
 		var sale Sale
-		if err := rows.Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.BranchID, &sale.BranchName, &sale.CreatedAt); err != nil {
+		if err := rows.Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.BranchID, &sale.BranchName, &sale.AgreementDiscountID, &sale.AgreementDiscountPercent, &sale.AgreementDiscountCents, &sale.SoldByUserID, &sale.SoldByName, &sale.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, sale)
@@ -393,13 +443,16 @@ func (s *store) get(ctx context.Context, tenantID, id string) (Sale, error) {
 	err := s.pool.QueryRow(ctx,
 		`SELECT s.id::text, s.tenant_id::text, s.total_cents, s.amount_paid_cents, s.change_cents,
 		        s.payment_method, s.customer_id::text, (cu.first_name || ' ' || cu.last_name), s.discount_cents, lr.promotion_name,
-		        s.branch_id::text, b.name, s.created_at
+		        s.branch_id::text, b.name,
+		        s.agreement_discount_id::text, s.agreement_discount_percent, s.agreement_discount_cents, s.user_id::text, us.name,
+		        s.created_at
 		   FROM sales s
 		   LEFT JOIN customers cu ON cu.id = s.customer_id
 		   LEFT JOIN loyalty_redemptions lr ON lr.sale_id = s.id
 		   LEFT JOIN branches b ON b.id = s.branch_id
+		   LEFT JOIN users us ON us.id = s.user_id
 		  WHERE s.id = $1 AND s.tenant_id = $2`, id, tenantID).
-		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.BranchID, &sale.BranchName, &sale.CreatedAt)
+		Scan(&sale.ID, &sale.TenantID, &sale.TotalCents, &sale.AmountPaidCents, &sale.ChangeCents, &sale.PaymentMethod, &sale.CustomerID, &sale.CustomerName, &sale.DiscountCents, &sale.PromotionName, &sale.BranchID, &sale.BranchName, &sale.AgreementDiscountID, &sale.AgreementDiscountPercent, &sale.AgreementDiscountCents, &sale.SoldByUserID, &sale.SoldByName, &sale.CreatedAt)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows), dberr.IsInvalidText(err):
 		return Sale{}, ErrNotFound

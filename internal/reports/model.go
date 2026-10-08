@@ -55,16 +55,37 @@ type SaleListItem struct {
 	CustomerName  *string `json:"customerName"`
 	TotalCents    int     `json:"totalCents"`
 	PaymentMethod string  `json:"paymentMethod"`
+	// Descuento de convenio (M12). Aditivos: ventas sin convenio => 0/null.
+	AgreementDiscountPercent *int    `json:"agreementDiscountPercent"`
+	AgreementDiscountCents   int     `json:"agreementDiscountCents"`
+	SoldByName               *string `json:"soldByName"` // null => "Sin registro"
+}
+
+// AgreementDiscountPercentBreakdown desglosa los descuentos de convenio por %.
+type AgreementDiscountPercentBreakdown struct {
+	Percent    int `json:"percent"`
+	Count      int `json:"count"`
+	TotalCents int `json:"totalCents"`
+}
+
+// AgreementDiscountsSummary resume los descuentos de convenio del período. El
+// total de ventas del reporte sigue siendo NETO (consistente con lealtad); este
+// bloque expone el monto de convenio aislado (ADR-010 §D1).
+type AgreementDiscountsSummary struct {
+	SalesCount int                                 `json:"salesCount"` // ventas con convenio
+	TotalCents int                                 `json:"totalCents"` // suma de agreement_discount_cents
+	ByPercent  []AgreementDiscountPercentBreakdown `json:"byPercent"`
 }
 
 type SalesReport struct {
-	TotalCents      int                 `json:"totalCents"`
-	SalesCount      int                 `json:"salesCount"`
-	ByPaymentMethod []PaymentBreakdown  `json:"byPaymentMethod"`
-	ByCategory      []CategoryBreakdown `json:"byCategory"`
-	ByHour          []HourBreakdown     `json:"byHour"`
-	ByBranch        []BranchBreakdown   `json:"byBranch"`
-	ByProduct       []ProductBreakdown  `json:"byProduct"`
+	TotalCents         int                       `json:"totalCents"`
+	SalesCount         int                       `json:"salesCount"`
+	ByPaymentMethod    []PaymentBreakdown        `json:"byPaymentMethod"`
+	ByCategory         []CategoryBreakdown       `json:"byCategory"`
+	ByHour             []HourBreakdown           `json:"byHour"`
+	ByBranch           []BranchBreakdown         `json:"byBranch"`
+	ByProduct          []ProductBreakdown        `json:"byProduct"`
+	AgreementDiscounts AgreementDiscountsSummary `json:"agreementDiscounts"`
 }
 
 // ---- Reporte de gastos -----------------------------------------------------

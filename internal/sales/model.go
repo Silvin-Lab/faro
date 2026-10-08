@@ -16,18 +16,26 @@ type SaleItem struct {
 
 // Sale es una venta registrada.
 type Sale struct {
-	ID              string     `json:"id"`
-	TenantID        string     `json:"tenantId"`
-	TotalCents      int        `json:"totalCents"`
-	AmountPaidCents int        `json:"amountPaidCents"`
-	ChangeCents     int        `json:"changeCents"`
-	DiscountCents   int        `json:"discountCents"` // descuento de lealtad calculado en servidor
-	PromotionName   *string    `json:"promotionName"` // nombre de la promo aplicada (o null)
-	PaymentMethod   string     `json:"paymentMethod"` // cash | card | transfer | didi
-	CustomerID      *string    `json:"customerId"`
-	CustomerName    *string    `json:"customerName"`
-	BranchID        *string    `json:"branchId"`   // sucursal derivada del usuario (nullable)
-	BranchName      *string    `json:"branchName"` // nombre de la sucursal (o null)
-	CreatedAt       time.Time  `json:"createdAt"`
-	Items           []SaleItem `json:"items,omitempty"`
+	ID              string  `json:"id"`
+	TenantID        string  `json:"tenantId"`
+	TotalCents      int     `json:"totalCents"`
+	AmountPaidCents int     `json:"amountPaidCents"`
+	ChangeCents     int     `json:"changeCents"`
+	DiscountCents   int     `json:"discountCents"` // descuento de lealtad calculado en servidor
+	PromotionName   *string `json:"promotionName"` // nombre de la promo aplicada (o null)
+	PaymentMethod   string  `json:"paymentMethod"` // cash | card | transfer | didi
+	CustomerID      *string `json:"customerId"`
+	CustomerName    *string `json:"customerName"`
+	BranchID        *string `json:"branchId"`   // sucursal derivada del usuario (nullable)
+	BranchName      *string `json:"branchName"` // nombre de la sucursal (o null)
+	// Descuento de convenio (M12, ADR-010): separado del de lealtad. Snapshot del %
+	// y monto al momento de la venta; total_cents ya es neto de ambos descuentos.
+	AgreementDiscountID      *string `json:"agreementDiscountId"`      // id del catálogo usado (o null)
+	AgreementDiscountPercent *int    `json:"agreementDiscountPercent"` // snapshot del % (o null)
+	AgreementDiscountCents   int     `json:"agreementDiscountCents"`   // monto del convenio (0 si no hubo)
+	// Atribución de la venta al usuario de la sesión (M12). Históricas = null.
+	SoldByUserID *string    `json:"soldByUserId"` // usuario que cobró (o null)
+	SoldByName   *string    `json:"soldByName"`   // nombre del usuario (null => "Sin registro")
+	CreatedAt    time.Time  `json:"createdAt"`
+	Items        []SaleItem `json:"items,omitempty"`
 }

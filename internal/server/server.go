@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"faro/internal/agreementdiscounts"
 	"faro/internal/auth"
 	"faro/internal/branches"
 	"faro/internal/categories"
@@ -29,7 +30,7 @@ import (
 // New construye el handler HTTP raíz. Los módulos (auth, products, …) montarán
 // aquí sus sub-routers en incrementos siguientes. corsOrigin es el origen del
 // frontend (faro-ui) autorizado a consumir la API con credenciales.
-func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, insightsSvc *insights.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
+func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *categories.Service, prodSvc *products.Service, salesSvc *sales.Service, custSvc *customers.Service, reportsSvc *reports.Service, insightsSvc *insights.Service, loyaltySvc *loyalty.Service, branchesSvc *branches.Service, settingsSvc *settings.Service, expensesSvc *expenses.Service, suppliesSvc *supplies.Service, warehouseSvc *warehouse.Service, agreementDiscountsSvc *agreementdiscounts.Service, uploadsH *uploads.Handler, uploadDir string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
@@ -82,6 +83,9 @@ func New(pool *pgxpool.Pool, corsOrigin string, authSvc *auth.Service, catSvc *c
 	r.Mount("/insights", insightsSvc.Routes(authSvc.RequireSession))
 	// Lealtad (M6 v2): lectura por sesión, CRUD de promociones solo super admin.
 	r.Mount("/loyalty", loyaltySvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
+	// Descuentos de convenio (M12): lectura por sesión (el POS lee los botones),
+	// CRUD del catálogo solo super admin.
+	r.Mount("/agreement-discounts", agreementDiscountsSvc.Routes(authSvc.RequireSession, authSvc.RequireSuperAdmin))
 	// Sucursales (M7): CRUD solo super admin.
 	r.Mount("/branches", branchesSvc.Routes(authSvc.RequireSuperAdmin))
 	// Ajustes del negocio (M7): favicon del tenant (solo super admin).

@@ -42,9 +42,10 @@ func NewService(pool *pgxpool.Pool) *Service {
 }
 
 // Create valida la solicitud y registra la venta. El servidor calcula el total y
-// el descuento de lealtad desde la promoción (no se confía en el cliente).
-// branchID se deriva del usuario autenticado (nunca del cliente); nil = sin sucursal.
-func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID, branchID *string) (Sale, error) {
+// los descuentos (lealtad y convenio) desde el catálogo (no se confía en el
+// cliente). branchID se deriva del usuario autenticado (nunca del cliente); nil =
+// sin sucursal. userID es el usuario de la sesión (quién cobró; nunca del cliente).
+func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInput, paymentMethod string, amountPaidCents int, customerID, promotionID, promotionProductID, branchID, agreementDiscountID, userID *string) (Sale, error) {
 	if len(items) == 0 || amountPaidCents < 0 {
 		return Sale{}, ErrValidation
 	}
@@ -55,17 +56,26 @@ func (svc *Service) Create(ctx context.Context, tenantID string, items []LineInp
 	promotionID = nilIfBlank(promotionID)
 	promotionProductID = nilIfBlank(promotionProductID)
 	branchID = nilIfBlank(branchID)
+	agreementDiscountID = nilIfBlank(agreementDiscountID)
+	userID = nilIfBlank(userID)
 	// La promoción solo tiene sentido con cliente asociado.
 	if customerID == nil {
 		promotionID = nil
 		promotionProductID = nil
+	}
+	// El convenio TAMBIÉN requiere cliente, pero (a diferencia de la promo) si el
+	// cliente mandó un descuento sin asociar cliente lo RECHAZAMOS con 422 en vez de
+	// ignorarlo: el POS ya mostró el total con descuento; registrarlo a precio
+	// completo descuadraría la caja en silencio (gate del orquestador, ADR-010 §D3).
+	if agreementDiscountID != nil && customerID == nil {
+		return Sale{}, ErrAgreementNotEligible
 	}
 	for _, it := range items {
 		if strings.TrimSpace(it.ProductID) == "" || it.Quantity <= 0 {
 			return Sale{}, ErrValidation
 		}
 	}
-	return svc.store.createSale(ctx, tenantID, items, paymentMethod, amountPaidCents, customerID, promotionID, promotionProductID, branchID)
+	return svc.store.createSale(ctx, tenantID, items, paymentMethod, amountPaidCents, customerID, promotionID, promotionProductID, branchID, agreementDiscountID, userID)
 }
 
 // nilIfBlank normaliza un puntero de string vacío/espacios a nil.

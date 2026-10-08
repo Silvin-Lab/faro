@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"faro/internal/agreementdiscounts"
 	"faro/internal/auth"
 	"faro/internal/branches"
 	"faro/internal/categories"
@@ -67,7 +68,7 @@ func setupM7(t *testing.T) *m7Env {
 		categories.NewService(pool), products.NewService(pool), sales.NewService(pool),
 		customers.NewService(pool), reports.NewService(pool), insights.NewService(pool), loyalty.NewService(pool),
 		branches.NewService(pool), settings.NewService(pool), expenses.NewService(pool),
-		supplies.NewService(pool), warehouse.NewService(pool), uploadsH, dir)
+		supplies.NewService(pool), warehouse.NewService(pool), agreementdiscounts.NewService(pool), uploadsH, dir)
 
 	env := &m7Env{srv: httptest.NewServer(handler), pool: pool}
 

@@ -40,6 +40,9 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 		ByHour:          []HourBreakdown{},
 		ByBranch:        []BranchBreakdown{},
 		ByProduct:       []ProductBreakdown{},
+		AgreementDiscounts: AgreementDiscountsSummary{
+			ByPercent: []AgreementDiscountPercentBreakdown{},
+		},
 	}
 
 	// Resumen.
@@ -186,7 +189,42 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 		rep.ByBranch = append(rep.ByBranch, b)
 	}
 	brRows.Close()
-	return rep, brRows.Err()
+	if err := brRows.Err(); err != nil {
+		return SalesReport{}, err
+	}
+
+	// Descuentos de convenio (M12, ADR-010 §3.5): resumen aislado del monto de
+	// convenio. El totalCents del reporte sigue siendo neto; esto NO lo altera.
+	adCond, adArgs := branchClause("", 4, branch)
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FILTER (WHERE agreement_discount_cents > 0),
+		        COALESCE(SUM(agreement_discount_cents), 0)
+		   FROM sales WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3`+adCond,
+		append([]any{tenantID, from, to}, adArgs...)...).
+		Scan(&rep.AgreementDiscounts.SalesCount, &rep.AgreementDiscounts.TotalCents); err != nil {
+		return SalesReport{}, err
+	}
+
+	adPctCond, adPctArgs := branchClause("", 4, branch)
+	adRows, err := s.pool.Query(ctx,
+		`SELECT agreement_discount_percent, COUNT(*), COALESCE(SUM(agreement_discount_cents), 0)
+		   FROM sales WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
+		     AND agreement_discount_cents > 0`+adPctCond+`
+		  GROUP BY agreement_discount_percent ORDER BY agreement_discount_percent`,
+		append([]any{tenantID, from, to}, adPctArgs...)...)
+	if err != nil {
+		return SalesReport{}, err
+	}
+	for adRows.Next() {
+		var b AgreementDiscountPercentBreakdown
+		if err := adRows.Scan(&b.Percent, &b.Count, &b.TotalCents); err != nil {
+			adRows.Close()
+			return SalesReport{}, err
+		}
+		rep.AgreementDiscounts.ByPercent = append(rep.AgreementDiscounts.ByPercent, b)
+	}
+	adRows.Close()
+	return rep, adRows.Err()
 }
 
 // salesList devuelve las ventas individuales del negocio en [from, to), más
@@ -195,9 +233,11 @@ func (s *store) salesReport(ctx context.Context, tenantID string, from, to time.
 func (s *store) salesList(ctx context.Context, tenantID string, from, to time.Time, branch BranchFilter) ([]SaleListItem, error) {
 	cond, args := branchClause("s.", 4, branch)
 	rows, err := s.pool.Query(ctx,
-		`SELECT s.id::text, s.created_at, (cu.first_name || ' ' || cu.last_name), s.total_cents, s.payment_method
+		`SELECT s.id::text, s.created_at, (cu.first_name || ' ' || cu.last_name), s.total_cents, s.payment_method,
+		        s.agreement_discount_percent, s.agreement_discount_cents, us.name
 		   FROM sales s
 		   LEFT JOIN customers cu ON cu.id = s.customer_id
+		   LEFT JOIN users us ON us.id = s.user_id
 		  WHERE s.tenant_id = $1 AND s.created_at >= $2 AND s.created_at < $3`+cond+`
 		  ORDER BY s.created_at DESC
 		  LIMIT 500`,
@@ -210,7 +250,7 @@ func (s *store) salesList(ctx context.Context, tenantID string, from, to time.Ti
 	for rows.Next() {
 		var it SaleListItem
 		var createdAt time.Time
-		if err := rows.Scan(&it.ID, &createdAt, &it.CustomerName, &it.TotalCents, &it.PaymentMethod); err != nil {
+		if err := rows.Scan(&it.ID, &createdAt, &it.CustomerName, &it.TotalCents, &it.PaymentMethod, &it.AgreementDiscountPercent, &it.AgreementDiscountCents, &it.SoldByName); err != nil {
 			return nil, err
 		}
 		it.CreatedAt = createdAt.Format(time.RFC3339)

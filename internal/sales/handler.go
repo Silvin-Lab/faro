@@ -38,12 +38,13 @@ type lineRequest struct {
 }
 
 type createRequest struct {
-	Items              []lineRequest `json:"items"`
-	PaymentMethod      string        `json:"paymentMethod"` // cash | card | transfer | didi
-	AmountPaidCents    int           `json:"amountPaidCents"`
-	CustomerID         *string       `json:"customerId"`
-	PromotionID        *string       `json:"promotionId"`        // a lo sumo una promoción
-	PromotionProductID *string       `json:"promotionProductId"` // unidad beneficiada (opcional)
+	Items               []lineRequest `json:"items"`
+	PaymentMethod       string        `json:"paymentMethod"` // cash | card | transfer | didi
+	AmountPaidCents     int           `json:"amountPaidCents"`
+	CustomerID          *string       `json:"customerId"`
+	PromotionID         *string       `json:"promotionId"`         // a lo sumo una promoción
+	PromotionProductID  *string       `json:"promotionProductId"`  // unidad beneficiada (opcional)
+	AgreementDiscountID *string       `json:"agreementDiscountId"` // descuento de convenio (opcional)
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +68,14 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 		items = append(items, LineInput{ProductID: it.ProductID, Quantity: it.Quantity})
 	}
 
-	sale, err := svc.Create(r.Context(), tenantID, items, req.PaymentMethod, req.AmountPaidCents, req.CustomerID, req.PromotionID, req.PromotionProductID, &branchID)
+	// El usuario que cobra se toma de la sesión (nunca del cuerpo); nil solo si no
+	// hay sesión (no debería, RequireSession ya corrió). Las ventas lo registran.
+	var userID *string
+	if u, ok := auth.UserFromContext(r.Context()); ok {
+		userID = &u.ID
+	}
+
+	sale, err := svc.Create(r.Context(), tenantID, items, req.PaymentMethod, req.AmountPaidCents, req.CustomerID, req.PromotionID, req.PromotionProductID, &branchID, req.AgreementDiscountID, userID)
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Venta inválida (items y cantidades > 0)")
@@ -77,6 +85,8 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_product", "Algún producto no es válido o está inactivo")
 	case errors.Is(err, ErrPromotionNotEligible):
 		writeError(w, http.StatusUnprocessableEntity, "promotion_not_eligible", "La promoción no es aplicable (umbral no alcanzado)")
+	case errors.Is(err, ErrAgreementNotEligible):
+		writeError(w, http.StatusUnprocessableEntity, "agreement_discount_not_eligible", "El descuento de convenio no es aplicable (inactivo, de otro negocio o sin cliente asociado)")
 	case errors.Is(err, ErrInsufficientPayment):
 		writeError(w, http.StatusBadRequest, "insufficient_payment", "El monto recibido es menor al total")
 	case err != nil:

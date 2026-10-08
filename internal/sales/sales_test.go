@@ -13,16 +13,16 @@ import (
 func TestCreateValidatesInput(t *testing.T) {
 	svc := NewService(nil)
 	ctx := context.Background()
-	if _, err := svc.Create(ctx, "t1", nil, "cash", 100, nil, nil, nil, nil); err != ErrValidation {
+	if _, err := svc.Create(ctx, "t1", nil, "cash", 100, nil, nil, nil, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("items vacíos: esperaba ErrValidation, obtuvo %v", err)
 	}
-	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 0}}, "cash", 100, nil, nil, nil, nil); err != ErrValidation {
+	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 0}}, "cash", 100, nil, nil, nil, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("cantidad 0: esperaba ErrValidation, obtuvo %v", err)
 	}
-	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "cheque", 100, nil, nil, nil, nil); err != ErrValidation {
+	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "cheque", 100, nil, nil, nil, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("forma de pago inválida: esperaba ErrValidation, obtuvo %v", err)
 	}
-	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "paypal", 100, nil, nil, nil, nil); err != ErrValidation {
+	if _, err := svc.Create(ctx, "t1", []LineInput{{ProductID: "p1", Quantity: 1}}, "paypal", 100, nil, nil, nil, nil, nil, nil); err != ErrValidation {
 		t.Fatalf("paypal no aceptado: esperaba ErrValidation, obtuvo %v", err)
 	}
 }
@@ -58,7 +58,7 @@ func testSvc(t *testing.T) (svc *Service, pool *pgxpool.Pool, a, b, prodA, prodI
 		pool.Close()
 		t.Skipf("DB de test no disponible: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE loyalty_redemptions, loyalty_promotion_products, loyalty_promotions, sale_items, sales, customers, products, categories, users, tenants RESTART IDENTITY CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE agreement_discounts, loyalty_redemptions, loyalty_promotion_products, loyalty_promotions, sale_items, sales, customers, products, categories, users, tenants RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	priceA = 4500
@@ -74,7 +74,7 @@ func TestCreateSaleComputesTotalAndChange(t *testing.T) {
 	svc, pool, a, _, prodA, _, _, price := testSvc(t)
 	defer pool.Close()
 
-	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 2}}, "cash", 10000, nil, nil, nil, nil)
+	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 2}}, "cash", 10000, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("crear venta: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestInsufficientPayment(t *testing.T) {
 	svc, pool, a, _, prodA, _, _, price := testSvc(t)
 	defer pool.Close()
 	// paga menos que el total (price*1).
-	if _, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price-1, nil, nil, nil, nil); err != ErrInsufficientPayment {
+	if _, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price-1, nil, nil, nil, nil, nil, nil); err != ErrInsufficientPayment {
 		t.Fatalf("pago insuficiente: esperaba ErrInsufficientPayment, obtuvo %v", err)
 	}
 }
@@ -105,7 +105,7 @@ func TestCardPaymentSetsExactAmount(t *testing.T) {
 	svc, pool, a, _, prodA, _, _, price := testSvc(t)
 	defer pool.Close()
 	// Con tarjeta, el monto enviado se ignora: el pagado = total y cambio = 0.
-	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "card", 0, nil, nil, nil, nil)
+	sale, err := svc.Create(context.Background(), a, []LineInput{{ProductID: prodA, Quantity: 1}}, "card", 0, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("venta con tarjeta: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestExactPaymentMethodsPersist(t *testing.T) {
 
 	for _, method := range []string{"transfer", "didi"} {
 		// amountPaidCents se ignora en pagos exactos: el pagado = total, cambio = 0.
-		sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, method, 0, nil, nil, nil, nil)
+		sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, method, 0, nil, nil, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatalf("venta con %s: %v", method, err)
 		}
@@ -149,10 +149,10 @@ func TestInactiveOrForeignProductRejected(t *testing.T) {
 	svc, pool, a, _, _, prodInactive, prodB, _ := testSvc(t)
 	defer pool.Close()
 	ctx := context.Background()
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodInactive, Quantity: 1}}, "cash", 100000, nil, nil, nil, nil); err != ErrInvalidProduct {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodInactive, Quantity: 1}}, "cash", 100000, nil, nil, nil, nil, nil, nil); err != ErrInvalidProduct {
 		t.Fatalf("producto inactivo: esperaba ErrInvalidProduct, obtuvo %v", err)
 	}
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodB, Quantity: 1}}, "cash", 100000, nil, nil, nil, nil); err != ErrInvalidProduct {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodB, Quantity: 1}}, "cash", 100000, nil, nil, nil, nil, nil, nil); err != ErrInvalidProduct {
 		t.Fatalf("producto de otro negocio: esperaba ErrInvalidProduct, obtuvo %v", err)
 	}
 }
@@ -163,7 +163,7 @@ func TestGetAndIsolation(t *testing.T) {
 	ctx := context.Background()
 
 	branchA := seedBranch(t, pool, a, "Centro")
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", 5000, nil, nil, nil, &branchA)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", 5000, nil, nil, nil, &branchA, nil, nil)
 	if err != nil {
 		t.Fatalf("crear: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestSaleAppliesPromotionDiscount(t *testing.T) {
 	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
 	promoID := seedPromotion(t, pool, a, prodA, "50% Latte", 50, 3, false)
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("venta con promo: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestSalePromotion100ResetsAndSnapshots(t *testing.T) {
 	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
 	promoID := seedPromotion(t, pool, a, prodA, "Latte gratis", 100, 3, true)
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("venta gratis: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestSaleDiscountRoundTrip(t *testing.T) {
 	promoID := seedPromotion(t, pool, a, prodA, "50% Latte", 50, 3, false)
 	branchA := seedBranch(t, pool, a, "Centro")
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, &branchA)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, &branchA, nil, nil)
 	if err != nil {
 		t.Fatalf("venta con promo: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestSalePromotionEligibleButProductNotInCart(t *testing.T) {
 	// Promo sobre prodA, con reinicio; el carrito solo lleva prodOther.
 	promoID := seedPromotion(t, pool, a, prodA, "Latte gratis", 100, 3, true)
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodOther, Quantity: 1}}, "cash", priceOther, &cust, &promoID, nil, nil)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodOther, Quantity: 1}}, "cash", priceOther, &cust, &promoID, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("venta sin producto de promo: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestSalePromotionChoosesHigherPricedEligibleUnit(t *testing.T) {
 	// Sin promotionProductId: elige el elegible de mayor precio (prodPremium).
 	saleAuto, err := svc.Create(ctx, a,
 		[]LineInput{{ProductID: prodA, Quantity: 1}, {ProductID: prodPremium, Quantity: 1}},
-		"cash", price+pricePremium, &custAuto, &promoID, nil, nil)
+		"cash", price+pricePremium, &custAuto, &promoID, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("venta auto: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestSalePromotionChoosesHigherPricedEligibleUnit(t *testing.T) {
 	// Con promotionProductId=prodA explícito: beneficia esa unidad aunque sea más barata.
 	saleExplicit, err := svc.Create(ctx, a,
 		[]LineInput{{ProductID: prodA, Quantity: 1}, {ProductID: prodPremium, Quantity: 1}},
-		"cash", price+pricePremium, &custExplicit, &promoID, &prodA, nil)
+		"cash", price+pricePremium, &custExplicit, &promoID, &prodA, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("venta explícita: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestSalePromotionSingleRedemptionPerCycle(t *testing.T) {
 	promoID := seedPromotion(t, pool, a, prodA, "50% Latte", 50, 3, false)
 
 	// Primer canje: éxito (visits 2 -> 3).
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil); err != nil {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil, nil, nil); err != nil {
 		t.Fatalf("primer canje: %v", err)
 	}
 	var visits int
@@ -455,7 +455,7 @@ func TestSalePromotionSingleRedemptionPerCycle(t *testing.T) {
 	}
 
 	// Segundo canje de la MISMA promo en el mismo ciclo: 422 aunque 3+1 >= 3.
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil); err != ErrPromotionNotEligible {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil, nil, nil); err != ErrPromotionNotEligible {
 		t.Fatalf("segundo canje mismo ciclo: esperaba ErrPromotionNotEligible, obtuvo %v", err)
 	}
 	// La segunda venta no se registró (rollback): solo hay 1 venta y 1 redención.
@@ -487,16 +487,16 @@ func TestSalePromotionResetOpensNewCycle(t *testing.T) {
 	pReset := seedPromotion(t, pool, a, prodB2, "Muffin gratis", 100, 3, true) // umbral 3, reinicia
 
 	// Ciclo 1: visits=1. Canjear pReg (1+1>=2) => visits 1 -> 2.
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &pReg, nil, nil); err != nil {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &pReg, nil, nil, nil, nil); err != nil {
 		t.Fatalf("canje pReg ciclo1: %v", err)
 	}
 	// Reintento de pReg en el mismo ciclo => 422.
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &pReg, nil, nil); err != ErrPromotionNotEligible {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &pReg, nil, nil, nil, nil); err != ErrPromotionNotEligible {
 		t.Fatalf("reintento pReg ciclo1: esperaba ErrPromotionNotEligible, obtuvo %v", err)
 	}
 
 	// Canjear pReset (visits=2, 2+1>=3) => visits 2 -> 3 -> reinicio 0.
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodB2, Quantity: 1}}, "cash", priceB2, &cust, &pReset, nil, nil); err != nil {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodB2, Quantity: 1}}, "cash", priceB2, &cust, &pReset, nil, nil, nil, nil); err != nil {
 		t.Fatalf("canje pReset: %v", err)
 	}
 	var visits int
@@ -506,11 +506,11 @@ func TestSalePromotionResetOpensNewCycle(t *testing.T) {
 	}
 
 	// Ciclo 2: re-alcanzar umbral de pReg. Venta sin promo => visits 0 -> 1.
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, nil, nil, nil); err != nil {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("venta sin promo ciclo2: %v", err)
 	}
 	// pReg vuelve a ser canjeable en el nuevo ciclo (1+1>=2, redención vieja < last_reset_at).
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &pReg, nil, nil)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &pReg, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("recanje pReg ciclo2: esperaba éxito, obtuvo %v", err)
 	}
@@ -536,7 +536,7 @@ func TestSalePromotionNotEligible(t *testing.T) {
 	pool.QueryRow(ctx, "INSERT INTO customers (tenant_id, phone, first_name, last_name, visits) VALUES ($1,'555','Ana','Paz',2) RETURNING id::text", a).Scan(&cust)
 	promoID := seedPromotion(t, pool, a, prodA, "50% Latte", 50, 5, false)
 
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil); err != ErrPromotionNotEligible {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, &cust, &promoID, nil, nil, nil, nil); err != ErrPromotionNotEligible {
 		t.Fatalf("promo no elegible: esperaba ErrPromotionNotEligible, obtuvo %v", err)
 	}
 	// La venta no se registró (rollback).

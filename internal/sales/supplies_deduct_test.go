@@ -84,7 +84,7 @@ func TestSaleDeductsSuppliesPerRecipe(t *testing.T) {
 	seedStock(t, pool, a, milk, branchB, 5000)
 	seedStock(t, pool, a, coffee, branchB, 1000)
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 3}}, "cash", price*3, nil, nil, nil, &branchA)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 3}}, "cash", price*3, nil, nil, nil, &branchA, nil, nil)
 	if err != nil {
 		t.Fatalf("crear venta: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSaleWithoutRecipeIsNoop(t *testing.T) {
 	branchA := seedBranch(t, pool, a, "Centro")
 	// prodA no tiene receta.
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 2}}, "cash", price*2, nil, nil, nil, &branchA)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 2}}, "cash", price*2, nil, nil, nil, &branchA, nil, nil)
 	if err != nil {
 		t.Fatalf("venta sin receta: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestSaleNeverBlocksOnStockGoesNegative(t *testing.T) {
 	seedRecipe(t, pool, a, prodA, sugar, 500)
 	seedStock(t, pool, a, sugar, branchA, 100)
 
-	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, nil, nil, nil, &branchA)
+	sale, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 1}}, "cash", price, nil, nil, nil, &branchA, nil, nil)
 	if err != nil {
 		t.Fatalf("venta sobre stock insuficiente debía pasar: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestSaleMixedCartAggregatesSameProduct(t *testing.T) {
 		{ProductID: prodA, Quantity: 2},
 		{ProductID: prodNoRecipe, Quantity: 4},
 		{ProductID: prodA, Quantity: 3},
-	}, "cash", price*5+1500*4, nil, nil, nil, &branchA)
+	}, "cash", price*5+1500*4, nil, nil, nil, &branchA, nil, nil)
 	if err != nil {
 		t.Fatalf("venta mixta: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestSaleRollsBackDeductionOnLaterFailure(t *testing.T) {
 	}()
 
 	// La venta con cliente llega hasta el UPDATE de customers y falla ahí.
-	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 3}}, "cash", price*3, &cust, nil, nil, &branchA); err == nil {
+	if _, err := svc.Create(ctx, a, []LineInput{{ProductID: prodA, Quantity: 3}}, "cash", price*3, &cust, nil, nil, &branchA, nil, nil); err == nil {
 		t.Fatalf("esperaba error por el trigger, la venta no debía completarse")
 	}
 
