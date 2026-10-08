@@ -16,9 +16,16 @@ func (svc *Service) Routes(requireSession func(http.Handler) http.Handler) http.
 	r := chi.NewRouter()
 	r.Use(requireSession)
 	r.Post("/", svc.handleCreate)
-	r.Get("/", svc.handleSearch)               // ?phone=<exacto> | ?q=<texto>&limit=20 | ?limit=20&offset=0 (listado)
-	r.Patch("/{id}/visits", svc.handleSetVisits) // ajuste manual (migración de tarjetas): solo admin
+	r.Get("/", svc.handleSearch)                         // ?phone=<exacto> | ?q=<texto>&limit=20 | ?limit=20&offset=0 (listado)
+	r.Patch("/{id}/visits", svc.handleSetVisits)         // ajuste manual (migración de tarjetas): solo admin
+	r.Get("/{id}/visit-changes", svc.handleVisitChanges) // historial de auditoría: solo admin
 	return r
+}
+
+// isVisitsAdmin indica si el usuario puede sembrar/ajustar visitas y ver su
+// historial: super admin o branch_admin (cajero/barista no).
+func isVisitsAdmin(u auth.User) bool {
+	return u.IsSuperAdmin || u.Role == auth.RoleSuperAdmin || u.Role == auth.RoleBranchAdmin
 }
 
 type createRequest struct {
@@ -29,6 +36,11 @@ type createRequest struct {
 }
 
 func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
 	tenantID, ok := auth.ResolveTenant(w, r)
 	if !ok {
 		return
@@ -38,7 +50,14 @@ func (svc *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "validation_error", "Cuerpo inválido")
 		return
 	}
-	c, err := svc.Create(r.Context(), tenantID, req.Phone, req.FirstName, req.LastName, req.PriorVisits)
+	// Sembrar visitas al alta (priorVisits > 0) solo lo pueden hacer los admins: de
+	// lo contrario un cajero podría inflar visitas para disparar una promo de lealtad.
+	// Con 0 (o sin el campo) el alta sigue disponible para todos los roles.
+	if req.PriorVisits > 0 && !isVisitsAdmin(u) {
+		writeError(w, http.StatusForbidden, "prior_visits_forbidden", "Solo un administrador puede registrar visitas previas")
+		return
+	}
+	c, err := svc.Create(r.Context(), tenantID, req.Phone, req.FirstName, req.LastName, req.PriorVisits, &u.ID)
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "Teléfono, nombre y apellido son requeridos")
@@ -114,7 +133,7 @@ func (svc *Service) handleSetVisits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
 		return
 	}
-	if u.Role != auth.RoleSuperAdmin && u.Role != auth.RoleBranchAdmin {
+	if !isVisitsAdmin(u) {
 		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ajustar visitas")
 		return
 	}
@@ -127,7 +146,7 @@ func (svc *Service) handleSetVisits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "validation_error", "visits debe ser un entero ≥ 0")
 		return
 	}
-	c, err := svc.SetVisits(r.Context(), tenantID, chi.URLParam(r, "id"), *req.Visits)
+	c, err := svc.SetVisits(r.Context(), tenantID, chi.URLParam(r, "id"), *req.Visits, &u.ID)
 	switch {
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, "validation_error", "visits debe ser un entero ≥ 0")
@@ -137,5 +156,32 @@ func (svc *Service) handleSetVisits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "No se pudo actualizar el cliente")
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"customer": c})
+	}
+}
+
+// handleVisitChanges devuelve el historial de cambios de visitas de un cliente
+// (auditoría). Solo super_admin o branch_admin, como el ajuste de visitas.
+func (svc *Service) handleVisitChanges(w http.ResponseWriter, r *http.Request) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Sesión requerida")
+		return
+	}
+	if !isVisitsAdmin(u) {
+		writeError(w, http.StatusForbidden, "forbidden", "No autorizado para ver el historial de visitas")
+		return
+	}
+	tenantID, ok := auth.ResolveTenant(w, r)
+	if !ok {
+		return
+	}
+	items, err := svc.VisitChanges(r.Context(), tenantID, chi.URLParam(r, "id"))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "Cliente no encontrado")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo obtener el historial de visitas")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	}
 }

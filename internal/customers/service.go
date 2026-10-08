@@ -23,14 +23,17 @@ func NewService(pool *pgxpool.Pool) *Service {
 // registrar, ej. desde el POS) — evita el viaje de ida y vuelta de crear y luego
 // ajustar visitas, que además está restringido a admin (SetVisits) y no debía
 // bloquear a un cajero registrando un cliente nuevo.
-func (svc *Service) Create(ctx context.Context, tenantID, phone, firstName, lastName string, priorVisits int) (Customer, error) {
+// createdBy es el usuario de la sesión (nunca del cliente); se registra en el alta
+// y, si priorVisits > 0, en el historial de auditoría. La autorización de
+// priorVisits > 0 (solo admins) se aplica en el handler, con acceso al rol.
+func (svc *Service) Create(ctx context.Context, tenantID, phone, firstName, lastName string, priorVisits int, createdBy *string) (Customer, error) {
 	phone = strings.TrimSpace(phone)
 	firstName = strings.TrimSpace(firstName)
 	lastName = strings.TrimSpace(lastName)
 	if phone == "" || firstName == "" || lastName == "" || priorVisits < 0 {
 		return Customer{}, ErrValidation
 	}
-	return svc.store.create(ctx, tenantID, phone, firstName, lastName, priorVisits)
+	return svc.store.create(ctx, tenantID, phone, firstName, lastName, priorVisits, createdBy)
 }
 
 func (svc *Service) FindByPhone(ctx context.Context, tenantID, phone string) (Customer, error) {
@@ -43,11 +46,17 @@ func (svc *Service) FindByPhone(ctx context.Context, tenantID, phone string) (Cu
 
 // SetVisits fija las visitas del ciclo del cliente (ajuste manual: migración de
 // tarjetas físicas). El acumulado de por vida nunca decrece (GREATEST en el store).
-func (svc *Service) SetVisits(ctx context.Context, tenantID, id string, visits int) (Customer, error) {
+// userID es el usuario de la sesión; queda en el historial de auditoría.
+func (svc *Service) SetVisits(ctx context.Context, tenantID, id string, visits int, userID *string) (Customer, error) {
 	if visits < 0 {
 		return Customer{}, ErrValidation
 	}
-	return svc.store.setVisits(ctx, tenantID, id, visits)
+	return svc.store.setVisits(ctx, tenantID, id, visits, userID)
+}
+
+// VisitChanges devuelve el historial de cambios de visitas de un cliente (auditoría).
+func (svc *Service) VisitChanges(ctx context.Context, tenantID, customerID string) ([]VisitChange, error) {
+	return svc.store.visitChanges(ctx, tenantID, customerID)
 }
 
 // List devuelve clientes paginados (sin filtro de texto), para el listado por
